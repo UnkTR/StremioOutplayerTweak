@@ -18,6 +18,9 @@ static char kTotalLabelKey;
 static char kActionsKey;
 static char kBottomBarKey;
 static char kNextButtonKey;
+static char kTimerKey;
+
+static void LayoutOutplayerUI(UIView *controls);
 
 static BOOL gOptimisticPlaying = YES;
 
@@ -222,6 +225,9 @@ static void TriggerButton(UIView *controls, NSArray<NSString *> *titles) {
             CallVoidObj(controls, @selector(onDebugClicked:), sender);
         }
     });
+    add(@"Sonraki Bölüm", ^{
+        CallVoidObj(controls, @selector(onNextButtonTap:), sender);
+    });
     add(@"Bölümler / Detaylar", ^{
         CallVoidObj(controls, @selector(onDetailedSidebarTap:), sender);
     });
@@ -412,6 +418,17 @@ static void SetupOutplayerUI(UIView *controls) {
     objc_setAssociatedObject(controls, &kNextButtonKey, nextButton, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     objc_setAssociatedObject(controls, &kSetupKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
+    __weak UIView *weakControls = controls;
+    NSTimer *timer = [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *currentTimer) {
+        UIView *strongControls = weakControls;
+        if (!strongControls) {
+            [currentTimer invalidate];
+            return;
+        }
+        LayoutOutplayerUI(strongControls);
+    }];
+    objc_setAssociatedObject(controls, &kTimerKey, timer, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
     NSLog(@"[OutplayerTweak] Outplayer UI installed on %@", NSStringFromClass([controls class]));
 }
 
@@ -505,6 +522,20 @@ static void LayoutOutplayerUI(UIView *controls) {
     UpdatePlayIcon(controls);
 }
 
+static IMP gOriginalViewDidMoveToWindow = NULL;
+static void HookViewDidMoveToWindow(id self, SEL _cmd) {
+    if (gOriginalViewDidMoveToWindow) {
+        ((void (*)(id, SEL))gOriginalViewDidMoveToWindow)(self, _cmd);
+    }
+    __weak UIView *weakControls = (UIView *)self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        UIView *controls = weakControls;
+        if (!controls) return;
+        SetupOutplayerUI(controls);
+        LayoutOutplayerUI(controls);
+    });
+}
+
 static IMP gOriginalLayoutSubviews = NULL;
 static void HookLayoutSubviews(id self, SEL _cmd) {
     if (gOriginalLayoutSubviews) {
@@ -539,6 +570,7 @@ __attribute__((constructor)) static void TweakInitialize(void) {
         return;
     }
     InstallHook(controlsClass, @selector(layoutSubviews), (IMP)HookLayoutSubviews, &gOriginalLayoutSubviews);
+    InstallHook(controlsClass, @selector(viewDidMoveToWindow), (IMP)HookViewDidMoveToWindow, &gOriginalViewDidMoveToWindow);
     InstallHook(controlsClass, @selector(gestureRecognizer:shouldReceiveTouch:), (IMP)HookShouldReceiveTouch, &gOriginalShouldReceiveTouch);
     NSLog(@"[OutplayerTweak] hooked %@", NSStringFromClass(controlsClass));
 }
