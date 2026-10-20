@@ -26,6 +26,7 @@ jobs:
             -install_name @executable_path/Frameworks/StremioOutplayerTweak.dylib \
             -framework UIKit \
             -framework Foundation \
+            -framework CoreGraphics \
             -framework QuartzCore \
             -framework MediaPlayer \
             -o StremioOutplayerTweak.dylib \
