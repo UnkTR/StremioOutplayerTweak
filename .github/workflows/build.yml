@@ -1,0 +1,41 @@
+name: Build Stremio Outplayer Tweak
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build dylib
+        run: |
+          set -euo pipefail
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          xcrun --sdk iphoneos clang \
+            -arch arm64 \
+            -miphoneos-version-min=13.0 \
+            -isysroot "$SDK" \
+            -fobjc-arc \
+            -dynamiclib \
+            -install_name @rpath/StremioOutplayerTweak.dylib \
+            -framework UIKit \
+            -framework Foundation \
+            -framework QuartzCore \
+            -o StremioOutplayerTweak.dylib \
+            Tweak.m
+          codesign -f -s - StremioOutplayerTweak.dylib
+          file StremioOutplayerTweak.dylib
+          otool -L StremioOutplayerTweak.dylib
+
+      - name: Upload dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: StremioOutplayerTweak
+          path: StremioOutplayerTweak.dylib
+          if-no-files-found: error
