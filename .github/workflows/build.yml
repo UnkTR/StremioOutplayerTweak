@@ -27,6 +27,7 @@ jobs:
             -framework UIKit \
             -framework Foundation \
             -framework QuartzCore \
+            -framework MediaPlayer \
             -o StremioOutplayerTweak.dylib \
             Tweak.m
           codesign -f -s - StremioOutplayerTweak.dylib
