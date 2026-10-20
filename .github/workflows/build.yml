@@ -23,7 +23,7 @@ jobs:
             -isysroot "$SDK" \
             -fobjc-arc \
             -dynamiclib \
-            -install_name @rpath/StremioOutplayerTweak.dylib \
+            -install_name @executable_path/Frameworks/StremioOutplayerTweak.dylib \
             -framework UIKit \
             -framework Foundation \
             -framework QuartzCore \
@@ -34,9 +34,36 @@ jobs:
           file StremioOutplayerTweak.dylib
           otool -L StremioOutplayerTweak.dylib
 
-      - name: Upload dylib
+      - name: Embed tweak into IPA
+        run: |
+          set -euo pipefail
+          rm -rf work
+          mkdir -p work
+          unzip -q input/Stremio.ipa -d work
+          APP="work/Payload/Stremio.app"
+          test -f "$APP/Stremio"
+          cp StremioOutplayerTweak.dylib "$APP/Frameworks/StremioOutplayerTweak.dylib"
+          codesign -f -s - "$APP/Frameworks/StremioOutplayerTweak.dylib"
+          python3 -m venv venv
+          source venv/bin/activate
+          pip install --quiet lief
+          python embed_tweak.py "$APP/Stremio" "@executable_path/Frameworks/StremioOutplayerTweak.dylib"
+          otool -L "$APP/Stremio" | grep StremioOutplayerTweak
+          rm -rf "$APP/_CodeSignature"
+
+      - name: Package IPA
+        run: |
+          set -euo pipefail
+          cd work
+          zip -qry ../StremioOutplayerTweaked.ipa Payload
+          cd ..
+          ls -lh StremioOutplayerTweaked.ipa
+
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: StremioOutplayerTweak
-          path: StremioOutplayerTweak.dylib
+          name: StremioOutplayer
+          path: |
+            StremioOutplayerTweak.dylib
+            StremioOutplayerTweaked.ipa
           if-no-files-found: error
