@@ -44,6 +44,7 @@ jobs:
           unzip -q input/Stremio.ipa -d work
           APP="work/Payload/Stremio.app"
           test -f "$APP/Stremio"
+          echo "Stremio version: $(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Info.plist") build $(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$APP/Info.plist")"
           cp StremioOutplayerTweak.dylib "$APP/Frameworks/StremioOutplayerTweak.dylib"
           codesign -f -s - "$APP/Frameworks/StremioOutplayerTweak.dylib"
           if [ -d fonts ]; then

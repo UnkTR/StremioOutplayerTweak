@@ -958,6 +958,21 @@ static void LayoutOutplayerUI(UIView *controls) {
     UpdatePlayIcon(controls);
 }
 
+static void SetupScrub(UIView *controls);
+
+static UISlider *FindProgressSlider(UIView *root) {
+    if (!root) return nil;
+    for (UIView *view in root.subviews) {
+        if ([view isKindOfClass:[UISlider class]] &&
+            [NSStringFromClass([view class]) containsString:@"ProgressSlider"]) {
+            return (UISlider *)view;
+        }
+        UISlider *nested = FindProgressSlider(view);
+        if (nested) return nested;
+    }
+    return nil;
+}
+
 #pragma mark - Swipe to scrub (Outplayer style)
 
 static char kScrubberKey;
@@ -997,7 +1012,14 @@ static NSString *FormatClock(double seconds) {
 - (UISlider *)slider {
     UIView *controls = self.controls;
     if (!controls) return nil;
-    return objc_getAssociatedObject(controls, &kSliderKey);
+    UISlider *slider = objc_getAssociatedObject(controls, &kSliderKey);
+    if (!slider) {
+        // Stremio 2.1.0 shipped a reworked controls layout; if the Outplayer
+        // restyle bailed out we still need the slider, so look it up lazily.
+        slider = FindProgressSlider(controls);
+        if (slider) objc_setAssociatedObject(controls, &kSliderKey, slider, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    return slider;
 }
 
 #pragma mark Pill
@@ -1188,6 +1210,7 @@ static void HookViewDidMoveToWindow(id self, SEL _cmd) {
         if (!controls) return;
         SetupOutplayerUI(controls);
         LayoutOutplayerUI(controls);
+        SetupScrub(controls);
     });
 }
 
@@ -1198,6 +1221,7 @@ static void HookLayoutSubviews(id self, SEL _cmd) {
     }
     SetupOutplayerUI((UIView *)self);
     LayoutOutplayerUI((UIView *)self);
+    SetupScrub((UIView *)self);
 }
 
 static IMP gOriginalShouldReceiveTouch = NULL;
