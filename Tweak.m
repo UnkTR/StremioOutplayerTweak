@@ -1159,6 +1159,131 @@ static void ApplyWhiteProgressBar(UISlider *slider) {
     }
 }
 
+#pragma mark - Live scrubbing helpers (player lookup + coalesced seeks)
+
+// --- Live scrub tuning ------------------------------------------------------
+// Minimum time between two live seeks while dragging (seconds). 0.15 = ~7/s.
+static const CGFloat kLiveSeekPumpInterval = 0.15;
+// Pause the player while dragging so no audio leaks between seeks.
+static const BOOL kLiveScrubPauseDuringScrub = YES;
+// Master switch for the live-frame behaviour.
+static const BOOL kLiveScrubEnabled = YES;
+// ---------------------------------------------------------------------------
+
+static BOOL OPIsNumberOfType(const char *type) {
+    if (!type) return NO;
+    switch (type[0]) {
+        case 'd': case 'f': case 'B': case 'c': case 'b':
+        case 'q': case 'Q': case 'i': case 'I':
+            return YES;
+        default:
+            return NO;
+    }
+}
+
+// Finds a selector on `object` (walking its superclasses) whose name matches one
+// of `needles` and whose signature has exactly `argumentCount` arguments.
+static SEL OPFindSelector(id object, NSArray<NSString *> *needles, BOOL exact,
+                          NSInteger argumentCount, char *outArgumentType) {
+    if (!object) return NULL;
+    NSMutableSet<NSString *> *visited = [NSMutableSet set];
+    for (Class cls = [object class]; cls && cls != [NSObject class]; cls = class_getSuperclass(cls)) {
+        NSString *className = NSStringFromClass(cls);
+        if ([visited containsObject:className]) break;
+        [visited addObject:className];
+        unsigned int count = 0;
+        Method *methods = class_copyMethodList(cls, &count);
+        for (unsigned int i = 0; i < count; i++) {
+            SEL selector = method_getName(methods[i]);
+            NSString *name = NSStringFromSelector(selector);
+            BOOL matches = NO;
+            for (NSString *needle in needles) {
+                if (exact ? [name isEqualToString:needle]
+                          : [name rangeOfString:needle options:NSCaseInsensitiveSearch].location != NSNotFound) {
+                    matches = YES;
+                    break;
+                }
+            }
+            if (!matches) continue;
+            NSMethodSignature *signature = [object methodSignatureForSelector:selector];
+            if (!signature) continue;
+            if ((NSInteger)signature.numberOfArguments != argumentCount + 2) continue;
+            if (argumentCount == 1) {
+                const char *type = [signature getArgumentTypeAtIndex:2];
+                if (!OPIsNumberOfType(type)) continue;
+                if (outArgumentType) *outArgumentType = type[0];
+            } else if (outArgumentType) {
+                *outArgumentType = 0;
+            }
+            free(methods);
+            return selector;
+        }
+        free(methods);
+    }
+    return NULL;
+}
+
+static NSNumber *OPNumberValueForKey(id object, NSString *key) {
+    if (!object) return nil;
+    @try {
+        id value = [object valueForKey:key];
+        if ([value isKindOfClass:[NSNumber class]]) return (NSNumber *)value;
+    } @catch (__unused NSException *exception) {
+    }
+    return nil;
+}
+
+// Walks the responder chain and the ivars of the player view controller to find
+// an object that looks like the playback backend (AVPlayer, KSPlayer wrapper,
+// Stremio player manager, ...). Returns nil when nothing is reachable.
+static id OPFindPlayerObject(UIView *view) {
+    UIResponder *responder = view;
+    while (responder && ![responder isKindOfClass:[UIViewController class]]) {
+        responder = responder.nextResponder;
+    }
+    NSMutableArray *queue = [NSMutableArray array];
+    if (responder) [queue addObject:responder];
+    NSMutableSet *seen = [NSMutableSet set];
+
+    for (NSInteger guard = 0; guard < 80 && queue.count > 0; guard++) {
+        id object = queue.firstObject;
+        [queue removeObjectAtIndex:0];
+        if (!object || [seen containsObject:object]) continue;
+        [seen addObject:object];
+
+        if ([object isKindOfClass:[UIViewController class]]) {
+            for (UIViewController *child in ((UIViewController *)object).childViewControllers) {
+                [queue addObject:child];
+            }
+        }
+
+        BOOL looksLikePlayer = OPFindSelector(object, @[@"seek"], NO, 1, NULL) != NULL &&
+                               OPFindSelector(object, @[@"pause"], YES, 0, NULL) != NULL;
+        if (!looksLikePlayer && [object isKindOfClass:[NSObject class]]) {
+            NSString *className = NSStringFromClass([object class]);
+            looksLikePlayer = ([className containsString:@"Player"] || [className containsString:@"AVPlayer"]) &&
+                              OPFindSelector(object, @[@"seek"], NO, 1, NULL) != NULL;
+        }
+        if (looksLikePlayer) return object;
+
+        unsigned int count = 0;
+        Ivar *ivars = class_copyIvarList([object class], &count);
+        for (unsigned int i = 0; i < count; i++) {
+            Ivar ivar = ivars[i];
+            const char *type = ivar_getTypeEncoding(ivar);
+            if (!type || type[0] != '@') continue;
+            NSString *name = [NSString stringWithUTF8String:ivar_getName(ivar)].lowercaseString;
+            if ([name containsString:@"player"] || [name containsString:@"manager"] ||
+                [name containsString:@"layer"]) {
+                id value = object_getIvar(object, ivar);
+                if (value) [queue addObject:value];
+            }
+        }
+        free(ivars);
+    }
+    return nil;
+}
+
 @interface OPScrubber : NSObject <UIGestureRecognizerDelegate>
 @property (nonatomic, weak) UIView *controls;
 @property (nonatomic, weak) UIPanGestureRecognizer *pan;
@@ -1175,6 +1300,22 @@ static void ApplyWhiteProgressBar(UISlider *slider) {
 @property (nonatomic, strong) UILabel *durationLabel;
 @property (nonatomic, assign) CGFloat pillWidth;
 @property (nonatomic, assign) double durationForWidth;
+@property (nonatomic, assign) BOOL liveSession;
+@property (nonatomic, assign) BOOL scrubWasPlaying;
+@property (nonatomic, assign) BOOL pausedByUs;
+@property (nonatomic, assign) BOOL mutedByUs;
+@property (nonatomic, assign) BOOL muteStateSaved;
+@property (nonatomic, assign) BOOL savedMuted;
+@property (nonatomic, assign) float savedVolume;
+@property (nonatomic, assign) NSTimeInterval lastPumpTime;
+@property (nonatomic, strong) id seekTarget;
+@property (nonatomic, assign) SEL seekSelector;
+@property (nonatomic, assign) SEL pauseSelector;
+@property (nonatomic, assign) SEL playSelector;
+@property (nonatomic, assign) SEL muteSelector;
+@property (nonatomic, assign) SEL volumeSelector;
+@property (nonatomic, assign) char seekArgType;
+- (void)cancelLiveSession;
 @end
 
 @implementation OPScrubber
@@ -1199,6 +1340,178 @@ static void ApplyWhiteProgressBar(UISlider *slider) {
         }
     }
     return fallback;
+}
+
+#pragma mark Live scrubbing
+
+- (void)resolveLiveSeeker {
+    if (self.seekTarget && self.seekSelector) return;
+    id target = OPFindPlayerObject(self.controls);
+    if (!target) return;
+
+    char argumentType = 0;
+    SEL seek = OPFindSelector(target, @[@"seek"], NO, 1, &argumentType);
+    if (!seek) return;
+
+    self.seekTarget = target;
+    self.seekSelector = seek;
+    self.seekArgType = argumentType;
+    self.pauseSelector = OPFindSelector(target, @[@"pause"], YES, 0, NULL);
+    self.playSelector = OPFindSelector(target, @[@"play"], YES, 0, NULL);
+    self.muteSelector = OPFindSelector(target, @[@"setMuted", @"setMute", @"setAudioMuted"], NO, 1, NULL);
+    if (!self.muteSelector) {
+        self.volumeSelector = OPFindSelector(target, @[@"setVolume"], YES, 1, NULL);
+    }
+    NSLog(@"[OutplayerTweak] live seek target %@ seek=%@ pause=%@ play=%@ mute=%@",
+          NSStringFromClass([target class]),
+          NSStringFromSelector(seek),
+          self.pauseSelector ? NSStringFromSelector(self.pauseSelector) : @"-",
+          self.playSelector ? NSStringFromSelector(self.playSelector) : @"-",
+          self.muteSelector ? NSStringFromSelector(self.muteSelector) : (self.volumeSelector ? @"volume" : @"-"));
+}
+
+- (void)applyMute:(BOOL)muted {
+    id target = self.seekTarget;
+    if (!target) return;
+
+    if (self.muteSelector) {
+        if (muted) {
+            if (!self.muteStateSaved) {
+                NSNumber *current = OPNumberValueForKey(target, @"muted");
+                self.savedMuted = current ? current.boolValue : NO;
+                self.muteStateSaved = YES;
+            }
+            ((void (*)(id, SEL, BOOL))objc_msgSend)(target, self.muteSelector, YES);
+            self.mutedByUs = YES;
+        } else if (self.mutedByUs) {
+            ((void (*)(id, SEL, BOOL))objc_msgSend)(target, self.muteSelector, self.savedMuted);
+            self.mutedByUs = NO;
+        }
+        return;
+    }
+
+    if (self.volumeSelector) {
+        if (muted) {
+            if (!self.muteStateSaved) {
+                NSNumber *current = OPNumberValueForKey(target, @"volume");
+                self.savedVolume = current ? current.floatValue : 1.0f;
+                self.muteStateSaved = YES;
+            }
+            ((void (*)(id, SEL, float))objc_msgSend)(target, self.volumeSelector, 0.0f);
+            self.mutedByUs = YES;
+        } else if (self.mutedByUs) {
+            ((void (*)(id, SEL, float))objc_msgSend)(target, self.volumeSelector, self.savedVolume);
+            self.mutedByUs = NO;
+        }
+    }
+}
+
+- (void)pauseForScrub {
+    if (self.pausedByUs) return;
+    id target = self.seekTarget;
+    if (target && self.pauseSelector) {
+        ((void (*)(id, SEL))objc_msgSend)(target, self.pauseSelector);
+        self.pausedByUs = YES;
+        return;
+    }
+    UIView *controls = self.controls;
+    if ([controls respondsToSelector:@selector(onPlayButtonTap:)]) {
+        id sender = objc_getAssociatedObject(controls, &kPlayButtonKey);
+        CallVoidObj(controls, @selector(onPlayButtonTap:), sender);
+        self.pausedByUs = YES;
+    }
+}
+
+- (void)resumeAfterScrub {
+    if (!self.pausedByUs) return;
+    id target = self.seekTarget;
+    if (target && self.playSelector) {
+        ((void (*)(id, SEL))objc_msgSend)(target, self.playSelector);
+    } else {
+        UIView *controls = self.controls;
+        if ([controls respondsToSelector:@selector(onPlayButtonTap:)]) {
+            id sender = objc_getAssociatedObject(controls, &kPlayButtonKey);
+            CallVoidObj(controls, @selector(onPlayButtonTap:), sender);
+        }
+    }
+    self.pausedByUs = NO;
+}
+
+- (void)seekPlayerTo:(double)seconds {
+    id target = self.seekTarget;
+    if (target && self.seekSelector) {
+        char type = self.seekArgType;
+        if (type == 'f') {
+            ((void (*)(id, SEL, float))objc_msgSend)(target, self.seekSelector, (float)seconds);
+        } else if (type == 'q' || type == 'Q' || type == 'i' || type == 'I') {
+            ((void (*)(id, SEL, long long))objc_msgSend)(target, self.seekSelector,
+                                                         (long long)llround(seconds));
+        } else {
+            ((void (*)(id, SEL, double))objc_msgSend)(target, self.seekSelector, seconds);
+        }
+        return;
+    }
+
+    // Fallback: Stremio's own slider handlers perform the real seek when the
+    // "touch up" event arrives, so fire one and re-enter the drag state.
+    UIView *controls = self.controls;
+    UISlider *slider = [self slider];
+    if (!controls || !slider) return;
+    [self call:@selector(onSliderTouchUpInside:) argument:slider];
+    [self call:@selector(onSliderTouchDown:) argument:slider];
+}
+
+- (void)beginLiveSession {
+    if (!kLiveScrubEnabled || self.liveSession) return;
+    self.liveSession = YES;
+    self.scrubWasPlaying = CurrentlyPlaying();
+    self.pausedByUs = NO;
+    self.mutedByUs = NO;
+    self.muteStateSaved = NO;
+    self.lastPumpTime = 0.0;
+
+    [self resolveLiveSeeker];
+    if (kLiveScrubPauseDuringScrub && self.scrubWasPlaying) {
+        [self pauseForScrub];
+    }
+    [self applyMute:YES];
+}
+
+- (void)finishLiveSession {
+    if (!self.liveSession) return;
+    self.liveSession = NO;
+    [self applyMute:NO];
+    [self resumeAfterScrub];
+    self.seekTarget = nil;
+    self.seekSelector = NULL;
+    self.pauseSelector = NULL;
+    self.playSelector = NULL;
+    self.muteSelector = NULL;
+    self.volumeSelector = NULL;
+    self.seekArgType = 0;
+}
+
+- (void)cancelLiveSession {
+    if (!self.liveSession) return;
+    self.scrubbing = NO;
+    [self finishLiveSession];
+}
+
+- (void)liveSeekTo:(double)seconds force:(BOOL)force {
+    if (!kLiveScrubEnabled || !self.liveSession) return;
+    NSTimeInterval now = CFAbsoluteTimeGetCurrent();
+    if (!force && now - self.lastPumpTime < kLiveSeekPumpInterval) return;
+    self.lastPumpTime = now;
+
+    [self resolveLiveSeeker];
+    [self seekPlayerTo:seconds];
+
+    // The fallback path goes through Stremio's handlers, which may resume
+    // playback: keep the scrub silent.
+    if (self.scrubWasPlaying && !self.seekTarget && CurrentlyPlaying()) {
+        self.pausedByUs = NO;
+        [self pauseForScrub];
+    }
 }
 
 #pragma mark Pill
@@ -1415,6 +1728,7 @@ static const CGFloat kPillEdgeMargin = 16.0;
     SliderSetProgress(slider, target / self.duration);
     [self call:@selector(onSliderValChanged:) argument:slider];
     [self renderTarget:target delta:delta];
+    [self liveSeekTo:target force:NO];
 }
 
 - (void)handlePan:(UIPanGestureRecognizer *)pan {
@@ -1433,6 +1747,7 @@ static const CGFloat kPillEdgeMargin = 16.0;
             self.playbackTime = [self livePlaybackTimeWithFallback:self.startTime];
             self.scrubbing = YES;
             [self showPillForDuration:duration];
+            [self beginLiveSession];
             [self call:@selector(onSliderTouchDown:) argument:slider];
             [self applyDrag:translation.x];
             break;
@@ -1449,7 +1764,10 @@ static const CGFloat kPillEdgeMargin = 16.0;
             [self applyDrag:translation.x];
             self.scrubbing = NO;
             UISlider *current = [self slider] ?: slider;
+            double finalTime = SliderProgress(current) * self.duration;
+            [self liveSeekTo:finalTime force:YES];
             [self call:@selector(onSliderTouchUpInside:) argument:current];
+            [self finishLiveSession];
             [self hidePillSoon];
             break;
         }
@@ -1487,6 +1805,13 @@ static const CGFloat kPillEdgeMargin = 16.0;
 
 @end
 
+static void AbortLiveScrubbing(UIView *controls) {
+    if (!controls) return;
+    OPScrubber *scrubber = objc_getAssociatedObject(controls, &kScrubberKey);
+    if (!scrubber) return;
+    [scrubber cancelLiveSession];
+}
+
 static void SetupScrub(UIView *controls) {
     if (!controls) return;
 
@@ -1504,6 +1829,14 @@ static void SetupScrub(UIView *controls) {
         scrubber.pan = pan;
 
         objc_setAssociatedObject(controls, &kScrubberKey, scrubber, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+        __weak UIView *weakControls = controls;
+        [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationDidEnterBackgroundNotification
+                                                        object:nil
+                                                         queue:NSOperationQueue.mainQueue
+                                                    usingBlock:^(NSNotification *note) {
+            AbortLiveScrubbing(weakControls);
+        }];
         NSLog(@"[OutplayerTweak] scrub gesture attached to %@", NSStringFromClass([host class]));
     }
 
@@ -1877,11 +2210,13 @@ static void HookLayoutSubviews(id self, SEL _cmd) {
     if (gOriginalLayoutSubviews) {
         ((void (*)(id, SEL))gOriginalLayoutSubviews)(self, _cmd);
     }
-    SetupOutplayerUI((UIView *)self);
-    LayoutOutplayerUI((UIView *)self);
-    SetupScrub((UIView *)self);
-    SetupTaps((UIView *)self);
-    UpdateSubtitlePresentation((UIView *)self);
+    UIView *controls = (UIView *)self;
+    if (!controls.window) AbortLiveScrubbing(controls);
+    SetupOutplayerUI(controls);
+    LayoutOutplayerUI(controls);
+    SetupScrub(controls);
+    SetupTaps(controls);
+    UpdateSubtitlePresentation(controls);
 }
 
 static IMP gOriginalShouldReceiveTouch = NULL;
