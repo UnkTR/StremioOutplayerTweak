@@ -820,6 +820,8 @@ static void SetupOutplayerUI(UIView *controls) {
     [[NSRunLoop mainRunLoop] addTimer:timer forMode:NSRunLoopCommonModes];
     objc_setAssociatedObject(controls, &kTimerKey, timer, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
+    SetupScrub(controls);
+
     NSLog(@"[OutplayerTweak] Outplayer UI installed on %@", NSStringFromClass([controls class]));
 }
 
@@ -954,6 +956,223 @@ static void LayoutOutplayerUI(UIView *controls) {
     EnsureZOrder(controls, ours);
     UpdateProgress(controls);
     UpdatePlayIcon(controls);
+}
+
+#pragma mark - Swipe to scrub (Outplayer style)
+
+static char kScrubberKey;
+// Full screen width of dragging == this fraction of the total duration.
+// Smaller = finer control. 0.5 on a 2 hour movie -> ~3 s per point on a 1180 pt iPad.
+static const double kScrubSpanFraction = 0.5;
+
+static NSString *FormatClock(double seconds) {
+    if (!isfinite(seconds) || seconds < 0) seconds = 0;
+    NSInteger total = (NSInteger)llround(seconds);
+    NSInteger h = total / 3600;
+    NSInteger m = (total % 3600) / 60;
+    NSInteger s = total % 60;
+    if (h > 0) return [NSString stringWithFormat:@"%ld:%02ld:%02ld", (long)h, (long)m, (long)s];
+    return [NSString stringWithFormat:@"%02ld:%02ld", (long)m, (long)s];
+}
+
+@interface OPScrubber : NSObject <UIGestureRecognizerDelegate>
+@property (nonatomic, weak) UIView *controls;
+@property (nonatomic, weak) UIPanGestureRecognizer *pan;
+@property (nonatomic, assign) BOOL scrubbing;
+@property (nonatomic, assign) double startTime;
+@property (nonatomic, assign) double duration;
+@property (nonatomic, strong) UIView *pill;
+@property (nonatomic, strong) UILabel *timeLabel;
+@property (nonatomic, strong) UILabel *deltaLabel;
+@end
+
+@implementation OPScrubber
+
+- (void)call:(SEL)selector argument:(id)argument {
+    UIView *controls = self.controls;
+    if (!controls || ![controls respondsToSelector:selector]) return;
+    ((VoidObjFn)objc_msgSend)(controls, selector, argument);
+}
+
+- (UISlider *)slider {
+    UIView *controls = self.controls;
+    if (!controls) return nil;
+    return objc_getAssociatedObject(controls, &kSliderKey);
+}
+
+#pragma mark Pill
+
+- (UIView *)ensurePill {
+    UIView *controls = self.controls;
+    if (!controls) return nil;
+    if (self.pill && self.pill.superview == controls) return self.pill;
+
+    UIView *pill = [[UIView alloc] initWithFrame:CGRectZero];
+    pill.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.74];
+    pill.layer.cornerRadius = 18.0;
+    pill.userInteractionEnabled = NO;
+    pill.alpha = 0.0;
+
+    UILabel *time = [[UILabel alloc] initWithFrame:CGRectZero];
+    time.font = InterTabularFont(26.0, UIFontWeightSemibold);
+    time.textColor = UIColor.whiteColor;
+    time.textAlignment = NSTextAlignmentCenter;
+
+    UILabel *delta = [[UILabel alloc] initWithFrame:CGRectZero];
+    delta.font = InterTabularFont(13.0, UIFontWeightMedium);
+    delta.textColor = [UIColor colorWithWhite:1.0 alpha:0.62];
+    delta.textAlignment = NSTextAlignmentCenter;
+
+    [pill addSubview:time];
+    [pill addSubview:delta];
+    [controls addSubview:pill];
+
+    self.pill = pill;
+    self.timeLabel = time;
+    self.deltaLabel = delta;
+    return pill;
+}
+
+- (void)layoutPill {
+    UIView *controls = self.controls;
+    UIView *pill = self.pill;
+    if (!controls || !pill) return;
+    CGSize size = CGSizeMake(196.0, 76.0);
+    CGFloat top = controls.safeAreaInsets.top + 26.0;
+    if (top < 88.0) top = 88.0;
+    pill.frame = CGRectMake((controls.bounds.size.width - size.width) / 2.0, top, size.width, size.height);
+    self.timeLabel.frame = CGRectMake(10.0, 12.0, size.width - 20.0, 36.0);
+    self.deltaLabel.frame = CGRectMake(10.0, 46.0, size.width - 20.0, 18.0);
+}
+
+- (void)showPill {
+    [self ensurePill];
+    [self layoutPill];
+    [self.controls bringSubviewToFront:self.pill];
+    self.pill.alpha = 1.0;
+}
+
+- (void)hidePillSoon {
+    __weak OPScrubber *weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        OPScrubber *strongSelf = weakSelf;
+        if (!strongSelf || strongSelf.scrubbing) return;
+        [UIView animateWithDuration:0.25 animations:^{
+            strongSelf.pill.alpha = 0.0;
+        }];
+    });
+}
+
+#pragma mark Scrubbing
+
+- (void)applyDrag:(CGFloat)dx {
+    UIView *controls = self.controls;
+    UISlider *slider = [self slider];
+    if (!controls || !slider || self.duration <= 0) return;
+
+    CGFloat width = controls.bounds.size.width;
+    if (!(width > 1.0)) width = 1.0;
+
+    double delta = ((double)dx / (double)width) * self.duration * kScrubSpanFraction;
+    double target = self.startTime + delta;
+    if (target < 0) target = 0;
+    if (target > self.duration) target = self.duration;
+
+    slider.value = (float)(target / self.duration);
+    [self call:@selector(onSliderValChanged:) argument:slider];
+
+    self.timeLabel.text = [NSString stringWithFormat:@"%@ / %@",
+                           FormatClock(target), FormatClock(self.duration)];
+    NSString *sign = delta < 0 ? @"-" : @"+";
+    self.deltaLabel.text = [NSString stringWithFormat:@"%@%@", sign, FormatClock(fabs(delta))];
+}
+
+- (void)handlePan:(UIPanGestureRecognizer *)pan {
+    UIView *controls = self.controls;
+    UISlider *slider = [self slider];
+    if (!controls || !slider) return;
+
+    CGPoint translation = [pan translationInView:pan.view];
+
+    switch (pan.state) {
+        case UIGestureRecognizerStateBegan: {
+            double duration = CurrentDuration(controls);
+            if (duration <= 0) return;
+            self.duration = duration;
+            self.startTime = (double)slider.value * duration;
+            self.scrubbing = YES;
+            [self showPill];
+            [self call:@selector(onSliderTouchDown:) argument:slider];
+            [self applyDrag:translation.x];
+            break;
+        }
+        case UIGestureRecognizerStateChanged: {
+            if (!self.scrubbing) return;
+            [self applyDrag:translation.x];
+            break;
+        }
+        case UIGestureRecognizerStateEnded:
+        case UIGestureRecognizerStateCancelled:
+        case UIGestureRecognizerStateFailed: {
+            if (!self.scrubbing) return;
+            [self applyDrag:translation.x];
+            self.scrubbing = NO;
+            UISlider *current = [self slider] ?: slider;
+            [self call:@selector(onSliderTouchUpInside:) argument:current];
+            [self hidePillSoon];
+            break;
+        }
+        default:
+            break;
+    }
+}
+
+#pragma mark UIGestureRecognizerDelegate
+
+- (BOOL)gestureRecognizerShouldBegin:(UIGestureRecognizer *)gestureRecognizer {
+    if (![gestureRecognizer isKindOfClass:[UIPanGestureRecognizer class]]) return YES;
+    CGPoint velocity = [(UIPanGestureRecognizer *)gestureRecognizer velocityInView:gestureRecognizer.view];
+    if (fabs(velocity.y) > fabs(velocity.x) * 0.77) return NO;
+    return [self slider] != nil && CurrentDuration(self.controls) > 0;
+}
+
+- (BOOL)gestureRecognizer:(UIGestureRecognizer *)gestureRecognizer shouldReceiveTouch:(UITouch *)touch {
+    UIView *controls = self.controls;
+    UIView *view = touch.view;
+    if (!controls || !view) return YES;
+    if ([view isKindOfClass:[UIControl class]]) return NO;
+
+    UIView *transportPill = objc_getAssociatedObject(controls, &kTransportPillKey);
+    UIView *progressPill = objc_getAssociatedObject(controls, &kProgressPillKey);
+    UIView *rightPill = objc_getAssociatedObject(controls, &kRightPillKey);
+
+    UIView *cursor = view;
+    while (cursor) {
+        if (cursor == transportPill || cursor == progressPill || cursor == rightPill) return NO;
+        cursor = cursor.superview;
+    }
+    return YES;
+}
+
+@end
+
+static void SetupScrub(UIView *controls) {
+    if (objc_getAssociatedObject(controls, &kScrubberKey)) return;
+
+    UIView *host = controls.superview ?: controls;
+    OPScrubber *scrubber = [[OPScrubber alloc] init];
+    scrubber.controls = controls;
+
+    UIPanGestureRecognizer *pan =
+        [[UIPanGestureRecognizer alloc] initWithTarget:scrubber action:@selector(handlePan:)];
+    pan.delegate = scrubber;
+    pan.cancelsTouchesInView = NO;
+    pan.maximumNumberOfTouches = 1;
+    [host addGestureRecognizer:pan];
+    scrubber.pan = pan;
+
+    objc_setAssociatedObject(controls, &kScrubberKey, scrubber, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    NSLog(@"[OutplayerTweak] scrub gesture attached to %@", NSStringFromClass([host class]));
 }
 
 #pragma mark - Hooks
