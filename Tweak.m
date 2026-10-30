@@ -1030,14 +1030,126 @@ static char kTapperKey;
 // Smaller = finer control. 0.5 on a 2 hour movie -> ~3 s per point on a 1180 pt iPad.
 static const double kScrubSpanFraction = 0.5;
 
+// m:ss under one hour, h:mm:ss above it (matches the Outplayer HUD).
 static NSString *FormatClock(double seconds) {
     if (!isfinite(seconds) || seconds < 0) seconds = 0;
-    NSInteger total = (NSInteger)llround(seconds);
-    NSInteger h = total / 3600;
-    NSInteger m = (total % 3600) / 60;
-    NSInteger s = total % 60;
-    if (h > 0) return [NSString stringWithFormat:@"%ld:%02ld:%02ld", (long)h, (long)m, (long)s];
-    return [NSString stringWithFormat:@"%02ld:%02ld", (long)m, (long)s];
+    long long total = (long long)llround(seconds);
+    long long h = total / 3600;
+    long long m = (total % 3600) / 60;
+    long long s = total % 60;
+    if (h > 0) return [NSString stringWithFormat:@"%lld:%02lld:%02lld", h, m, s];
+    return [NSString stringWithFormat:@"%lld:%02lld", m, s];
+}
+
+static CGFloat MeasuredWidth(NSString *text, UIFont *font) {
+    if (text.length == 0 || !font) return 0.0;
+    CGRect rect = [text boundingRectWithSize:CGSizeMake(CGFLOAT_MAX, CGFLOAT_MAX)
+                                     options:NSStringDrawingUsesLineFragmentOrigin
+                                  attributes:@{NSFontAttributeName: font}
+                                     context:nil];
+    return ceil(rect.size.width);
+}
+
+// Cached lookup of Stremio's progress slider, with a lazy fallback because the
+// 2.1.0 layout can rebuild (and reparent) the controls at any time.
+static UISlider *CachedSlider(UIView *controls) {
+    if (!controls) return nil;
+    UISlider *slider = objc_getAssociatedObject(controls, &kSliderKey);
+    if (slider && slider.window) return slider;
+    UISlider *found = FindProgressSlider(controls);
+    if (found) {
+        objc_setAssociatedObject(controls, &kSliderKey, found, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        return found;
+    }
+    return slider;
+}
+
+#pragma mark - Progress bar colour (white fill, dim track, white thumb)
+
+static char kWhiteTrackImageKey;
+
+// Stremio's accent colour is a violet; anything clearly blue-dominant is it.
+static BOOL ColorIsAccentPurple(UIColor *color) {
+    if (!color) return NO;
+    CGFloat r = 0.0, g = 0.0, b = 0.0, a = 0.0;
+    if (![color getRed:&r green:&g blue:&b alpha:&a]) return NO;
+    if (a < 0.05) return NO;
+    return (b > r + 0.10) && (b > g + 0.10);
+}
+
+static void RecolorPurpleLayers(CALayer *layer, NSInteger depth) {
+    if (!layer || depth < 0) return;
+
+    if (layer.backgroundColor) {
+        UIColor *color = [UIColor colorWithCGColor:layer.backgroundColor];
+        if (ColorIsAccentPurple(color)) layer.backgroundColor = UIColor.whiteColor.CGColor;
+    }
+    if (layer.borderColor) {
+        UIColor *color = [UIColor colorWithCGColor:layer.borderColor];
+        if (ColorIsAccentPurple(color)) layer.borderColor = UIColor.whiteColor.CGColor;
+    }
+    if ([layer isKindOfClass:[CAShapeLayer class]]) {
+        CAShapeLayer *shape = (CAShapeLayer *)layer;
+        if (shape.strokeColor && ColorIsAccentPurple([UIColor colorWithCGColor:shape.strokeColor])) {
+            shape.strokeColor = UIColor.whiteColor.CGColor;
+        }
+        if (shape.fillColor && ColorIsAccentPurple([UIColor colorWithCGColor:shape.fillColor])) {
+            shape.fillColor = UIColor.whiteColor.CGColor;
+        }
+    }
+    for (CALayer *sub in layer.sublayers) RecolorPurpleLayers(sub, depth - 1);
+}
+
+static void ApplyWhiteProgressBar(UISlider *slider) {
+    if (!slider) return;
+
+    UIColor *white = UIColor.whiteColor;
+    UIColor *dim = [UIColor colorWithWhite:1.0 alpha:0.28];
+    BOOL changed = NO;
+
+    if (![slider.tintColor isEqual:white]) {
+        slider.tintColor = white;
+        changed = YES;
+    }
+    if (![slider.minimumTrackTintColor isEqual:white]) {
+        slider.minimumTrackTintColor = white;
+        changed = YES;
+    }
+    if (![slider.maximumTrackTintColor isEqual:dim]) {
+        slider.maximumTrackTintColor = dim;
+        changed = YES;
+    }
+    if (![slider.thumbTintColor isEqual:white]) {
+        slider.thumbTintColor = white;
+        changed = YES;
+    }
+
+    // Sliders painted with track images ignore the tint properties: recolour
+    // the existing image (keeps its shape and thickness) instead of replacing it.
+    UIImage *minimumImage = [slider minimumTrackImageForState:UIControlStateNormal];
+    if (minimumImage) {
+        UIImage *cached = objc_getAssociatedObject(slider, &kWhiteTrackImageKey);
+        if (cached != minimumImage) {
+            UIImage *recoloured = [minimumImage imageWithTintColor:white
+                                                     renderingMode:UIImageRenderingModeAlwaysOriginal];
+            if (recoloured) {
+                [slider setMinimumTrackImage:recoloured forState:UIControlStateNormal];
+                objc_setAssociatedObject(slider, &kWhiteTrackImageKey, recoloured,
+                                         OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                changed = YES;
+            }
+        }
+    }
+
+    // Custom drawn sliders (Stremio's ProgressSlider) colour layers directly.
+    static NSInteger recolourTick = 0;
+    recolourTick++;
+    if (changed || recolourTick % 60 == 0) {
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
+        RecolorPurpleLayers(slider.layer, 8);
+        [CATransaction commit];
+    }
 }
 
 @interface OPScrubber : NSObject <UIGestureRecognizerDelegate>
@@ -1046,9 +1158,16 @@ static NSString *FormatClock(double seconds) {
 @property (nonatomic, assign) BOOL scrubbing;
 @property (nonatomic, assign) double startTime;
 @property (nonatomic, assign) double duration;
+@property (nonatomic, assign) double playbackTime;
 @property (nonatomic, strong) UIView *pill;
-@property (nonatomic, strong) UILabel *timeLabel;
-@property (nonatomic, strong) UILabel *deltaLabel;
+@property (nonatomic, strong) UILabel *targetLabel;
+@property (nonatomic, strong) UILabel *arrowLabel;
+@property (nonatomic, strong) UIView *line;
+@property (nonatomic, strong) UIView *lineFill;
+@property (nonatomic, strong) UILabel *positionLabel;
+@property (nonatomic, strong) UILabel *durationLabel;
+@property (nonatomic, assign) CGFloat pillWidth;
+@property (nonatomic, assign) double durationForWidth;
 @end
 
 @implementation OPScrubber
@@ -1060,19 +1179,35 @@ static NSString *FormatClock(double seconds) {
 }
 
 - (UISlider *)slider {
-    UIView *controls = self.controls;
-    if (!controls) return nil;
-    UISlider *slider = objc_getAssociatedObject(controls, &kSliderKey);
-    if (!slider) {
-        // Stremio 2.1.0 shipped a reworked controls layout; if the Outplayer
-        // restyle bailed out we still need the slider, so look it up lazily.
-        slider = FindProgressSlider(controls);
-        if (slider) objc_setAssociatedObject(controls, &kSliderKey, slider, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    return CachedSlider(self.controls);
+}
+
+- (double)livePlaybackTimeWithFallback:(double)fallback {
+    NSDictionary *info = MPNowPlayingInfoCenter.defaultCenter.nowPlayingInfo;
+    NSNumber *elapsed = info[MPNowPlayingInfoPropertyElapsedPlaybackTime];
+    if (elapsed) {
+        double value = elapsed.doubleValue;
+        if (isfinite(value) && value >= 0.0 && (self.duration <= 0.0 || value <= self.duration + 1.0)) {
+            return value;
+        }
     }
-    return slider;
+    return fallback;
 }
 
 #pragma mark Pill
+
+// Pill geometry (matches the Outplayer scrub indicator).
+static const CGFloat kPillPadding = 12.0;
+static const CGFloat kPillCornerRadius = 16.0;
+static const CGFloat kPillRow1Height = 34.0;
+static const CGFloat kPillLineHeight = 2.0;
+static const CGFloat kPillRow3Height = 16.0;
+static const CGFloat kPillRow1Y = 12.0;
+static const CGFloat kPillLineY = 54.0;
+static const CGFloat kPillRow3Y = 64.0;
+static const CGFloat kPillHeight = 92.0;
+static const CGFloat kPillMinContentWidth = 96.0;
+static const CGFloat kPillEdgeMargin = 16.0;
 
 - (UIView *)ensurePill {
     UIView *controls = self.controls;
@@ -1080,48 +1215,146 @@ static NSString *FormatClock(double seconds) {
     if (self.pill && self.pill.superview == controls) return self.pill;
 
     UIView *pill = [[UIView alloc] initWithFrame:CGRectZero];
-    pill.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.74];
-    pill.layer.cornerRadius = 18.0;
+    pill.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.68];
+    pill.layer.cornerRadius = kPillCornerRadius;
+    pill.layer.cornerCurve = kCACornerCurveContinuous;
     pill.userInteractionEnabled = NO;
     pill.alpha = 0.0;
+    pill.clipsToBounds = YES;
 
-    UILabel *time = [[UILabel alloc] initWithFrame:CGRectZero];
-    time.font = InterTabularFont(26.0, UIFontWeightSemibold);
-    time.textColor = UIColor.whiteColor;
-    time.textAlignment = NSTextAlignmentCenter;
+    UIFont *targetFont = InterTabularFont(28.0, UIFontWeightBold);
+    UIFont *arrowFont = InterFont(22.0, UIFontWeightSemibold);
+    UIFont *smallFont = InterTabularFont(12.0, UIFontWeightMedium);
 
-    UILabel *delta = [[UILabel alloc] initWithFrame:CGRectZero];
-    delta.font = InterTabularFont(13.0, UIFontWeightMedium);
-    delta.textColor = [UIColor colorWithWhite:1.0 alpha:0.62];
-    delta.textAlignment = NSTextAlignmentCenter;
+    UILabel *target = [[UILabel alloc] initWithFrame:CGRectZero];
+    target.font = targetFont;
+    target.textColor = UIColor.whiteColor;
+    target.textAlignment = NSTextAlignmentLeft;
+    target.numberOfLines = 1;
+    target.lineBreakMode = NSLineBreakByClipping;
+    target.adjustsFontSizeToFitWidth = YES;
+    target.minimumScaleFactor = 0.6;
 
-    [pill addSubview:time];
-    [pill addSubview:delta];
+    UILabel *arrow = [[UILabel alloc] initWithFrame:CGRectZero];
+    arrow.font = arrowFont;
+    arrow.textColor = UIColor.whiteColor;
+    arrow.textAlignment = NSTextAlignmentRight;
+    arrow.numberOfLines = 1;
+    arrow.text = @"→";
+
+    UIView *line = [[UIView alloc] initWithFrame:CGRectZero];
+    line.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.24];
+    line.layer.cornerRadius = kPillLineHeight / 2.0;
+    line.clipsToBounds = YES;
+    line.userInteractionEnabled = NO;
+
+    UIView *fill = [[UIView alloc] initWithFrame:CGRectZero];
+    fill.backgroundColor = UIColor.whiteColor;
+    fill.userInteractionEnabled = NO;
+    [line addSubview:fill];
+
+    UILabel *position = [[UILabel alloc] initWithFrame:CGRectZero];
+    position.font = smallFont;
+    position.textColor = [UIColor colorWithWhite:1.0 alpha:0.88];
+    position.textAlignment = NSTextAlignmentLeft;
+    position.numberOfLines = 1;
+    position.lineBreakMode = NSLineBreakByClipping;
+    position.adjustsFontSizeToFitWidth = YES;
+    position.minimumScaleFactor = 0.6;
+
+    UILabel *total = [[UILabel alloc] initWithFrame:CGRectZero];
+    total.font = smallFont;
+    total.textColor = [UIColor colorWithWhite:1.0 alpha:0.48];
+    total.textAlignment = NSTextAlignmentRight;
+    total.numberOfLines = 1;
+    total.lineBreakMode = NSLineBreakByClipping;
+    total.adjustsFontSizeToFitWidth = YES;
+    total.minimumScaleFactor = 0.6;
+
+    [pill addSubview:target];
+    [pill addSubview:arrow];
+    [pill addSubview:line];
+    [pill addSubview:position];
+    [pill addSubview:total];
     [controls addSubview:pill];
 
     self.pill = pill;
-    self.timeLabel = time;
-    self.deltaLabel = delta;
+    self.targetLabel = target;
+    self.arrowLabel = arrow;
+    self.line = line;
+    self.lineFill = fill;
+    self.positionLabel = position;
+    self.durationLabel = total;
+    self.pillWidth = 0.0;
+    self.durationForWidth = -1.0;
     return pill;
+}
+
+// Width is derived from the total duration so it never changes while dragging.
+- (CGFloat)contentWidthForDuration:(double)duration {
+    NSString *widest = FormatClock(duration);
+    CGFloat targetWidth = MeasuredWidth(widest, self.targetLabel.font);
+    CGFloat arrowWidth = MAX(24.0, MeasuredWidth(@"→", self.arrowLabel.font));
+    CGFloat smallWidth = MeasuredWidth(widest, self.positionLabel.font);
+
+    CGFloat row1 = targetWidth + 8.0 + arrowWidth;
+    CGFloat row3 = smallWidth * 2.0 + 16.0;
+    return MAX(kPillMinContentWidth, MAX(row1, row3));
+}
+
+- (void)preparePillForDuration:(double)duration {
+    [self ensurePill];
+    if (self.pillWidth <= 0.0 || fabs(self.durationForWidth - duration) > 0.5) {
+        self.durationForWidth = duration;
+        CGFloat content = [self contentWidthForDuration:duration];
+        self.pillWidth = content + kPillPadding * 2.0;
+    }
+    [self layoutPill];
 }
 
 - (void)layoutPill {
     UIView *controls = self.controls;
     UIView *pill = self.pill;
     if (!controls || !pill) return;
-    CGSize size = CGSizeMake(196.0, 76.0);
-    CGFloat top = controls.safeAreaInsets.top + 26.0;
-    if (top < 88.0) top = 88.0;
-    pill.frame = CGRectMake((controls.bounds.size.width - size.width) / 2.0, top, size.width, size.height);
-    self.timeLabel.frame = CGRectMake(10.0, 12.0, size.width - 20.0, 36.0);
-    self.deltaLabel.frame = CGRectMake(10.0, 46.0, size.width - 20.0, 18.0);
+    if (self.pillWidth <= 0.0) return;
+
+    CGFloat safeTop = controls.safeAreaInsets.top;
+    CGFloat safeLeft = controls.safeAreaInsets.left;
+    if (safeTop <= 0.0 && controls.window) safeTop = controls.window.safeAreaInsets.top;
+    if (safeLeft <= 0.0 && controls.window) safeLeft = controls.window.safeAreaInsets.left;
+    if (safeTop < 0.0) safeTop = 0.0;
+    if (safeLeft < 0.0) safeLeft = 0.0;
+
+    CGFloat content = self.pillWidth - kPillPadding * 2.0;
+    CGFloat arrowWidth = MAX(24.0, MeasuredWidth(@"→", self.arrowLabel.font));
+    CGFloat targetWidth = MAX(0.0, content - arrowWidth - 8.0);
+    CGFloat smallWidth = floor(content * 0.5);
+
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    [UIView performWithoutAnimation:^{
+        pill.frame = CGRectMake(safeLeft + kPillEdgeMargin, safeTop + kPillEdgeMargin,
+                                self.pillWidth, kPillHeight);
+        self.targetLabel.frame = CGRectMake(kPillPadding, kPillRow1Y, targetWidth, kPillRow1Height);
+        self.arrowLabel.frame = CGRectMake(kPillPadding + content - arrowWidth, kPillRow1Y, arrowWidth,
+                                           kPillRow1Height);
+        self.line.frame = CGRectMake(kPillPadding, kPillLineY, content, kPillLineHeight);
+        self.lineFill.frame = CGRectMake(0.0, 0.0, 0.0, kPillLineHeight);
+        self.positionLabel.frame = CGRectMake(kPillPadding, kPillRow3Y, smallWidth, kPillRow3Height);
+        self.durationLabel.frame = CGRectMake(kPillPadding + content - smallWidth, kPillRow3Y, smallWidth,
+                                              kPillRow3Height);
+        [pill layoutIfNeeded];
+    }];
+    [CATransaction commit];
 }
 
-- (void)showPill {
-    [self ensurePill];
-    [self layoutPill];
+- (void)showPillForDuration:(double)duration {
+    [self preparePillForDuration:duration];
     [self.controls bringSubviewToFront:self.pill];
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
     self.pill.alpha = 1.0;
+    [CATransaction commit];
 }
 
 - (void)hidePillSoon {
@@ -1136,6 +1369,28 @@ static NSString *FormatClock(double seconds) {
 }
 
 #pragma mark Scrubbing
+
+- (void)renderTarget:(double)target delta:(double)delta {
+    UIView *line = self.line;
+    if (!line) return;
+
+    CGFloat progress = self.duration > 0.0 ? (CGFloat)(target / self.duration) : 0.0;
+    if (!isfinite(progress)) progress = 0.0;
+    progress = MAX(0.0, MIN(1.0, progress));
+    CGFloat fillWidth = floor(line.bounds.size.width * progress);
+
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    [UIView performWithoutAnimation:^{
+        self.targetLabel.text = FormatClock(target);
+        self.arrowLabel.text = delta < 0.0 ? @"←" : @"→";
+        self.positionLabel.text = FormatClock(self.playbackTime);
+        self.durationLabel.text = FormatClock(self.duration);
+        self.lineFill.frame = CGRectMake(0.0, 0.0, fillWidth, kPillLineHeight);
+        [self.lineFill.superview layoutIfNeeded];
+    }];
+    [CATransaction commit];
+}
 
 - (void)applyDrag:(CGFloat)dx {
     UIView *controls = self.controls;
@@ -1152,10 +1407,7 @@ static NSString *FormatClock(double seconds) {
 
     SliderSetProgress(slider, target / self.duration);
     [self call:@selector(onSliderValChanged:) argument:slider];
-    self.timeLabel.text = [NSString stringWithFormat:@"%@ / %@",
-                           FormatClock(target), FormatClock(self.duration)];
-    NSString *sign = delta < 0 ? @"-" : @"+";
-    self.deltaLabel.text = [NSString stringWithFormat:@"%@%@", sign, FormatClock(fabs(delta))];
+    [self renderTarget:target delta:delta];
 }
 
 - (void)handlePan:(UIPanGestureRecognizer *)pan {
@@ -1171,8 +1423,9 @@ static NSString *FormatClock(double seconds) {
             if (duration <= 0) return;
             self.duration = duration;
             self.startTime = SliderProgress(slider) * duration;
+            self.playbackTime = [self livePlaybackTimeWithFallback:self.startTime];
             self.scrubbing = YES;
-            [self showPill];
+            [self showPillForDuration:duration];
             [self call:@selector(onSliderTouchDown:) argument:slider];
             [self applyDrag:translation.x];
             break;
@@ -1228,22 +1481,28 @@ static NSString *FormatClock(double seconds) {
 @end
 
 static void SetupScrub(UIView *controls) {
-    if (objc_getAssociatedObject(controls, &kScrubberKey)) return;
+    if (!controls) return;
 
-    UIView *host = controls.superview ?: controls;
-    OPScrubber *scrubber = [[OPScrubber alloc] init];
-    scrubber.controls = controls;
+    if (!objc_getAssociatedObject(controls, &kScrubberKey)) {
+        UIView *host = controls.superview ?: controls;
+        OPScrubber *scrubber = [[OPScrubber alloc] init];
+        scrubber.controls = controls;
 
-    UIPanGestureRecognizer *pan =
-        [[UIPanGestureRecognizer alloc] initWithTarget:scrubber action:@selector(handlePan:)];
-    pan.delegate = scrubber;
-    pan.cancelsTouchesInView = NO;
-    pan.maximumNumberOfTouches = 1;
-    [host addGestureRecognizer:pan];
-    scrubber.pan = pan;
+        UIPanGestureRecognizer *pan =
+            [[UIPanGestureRecognizer alloc] initWithTarget:scrubber action:@selector(handlePan:)];
+        pan.delegate = scrubber;
+        pan.cancelsTouchesInView = NO;
+        pan.maximumNumberOfTouches = 1;
+        [host addGestureRecognizer:pan];
+        scrubber.pan = pan;
 
-    objc_setAssociatedObject(controls, &kScrubberKey, scrubber, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    NSLog(@"[OutplayerTweak] scrub gesture attached to %@", NSStringFromClass([host class]));
+        objc_setAssociatedObject(controls, &kScrubberKey, scrubber, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        NSLog(@"[OutplayerTweak] scrub gesture attached to %@", NSStringFromClass([host class]));
+    }
+
+    // Stremio re-applies its accent tint whenever the controls rebuild, so the
+    // white bar is re-asserted on every layout pass (cheap when already white).
+    ApplyWhiteProgressBar(CachedSlider(controls));
 }
 
 #pragma mark - Tap to play/pause
