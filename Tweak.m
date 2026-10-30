@@ -237,14 +237,52 @@ static BOOL CurrentlyPlaying(void) {
     return gOptimisticPlaying;
 }
 
+// Cached SF Symbols: re-creating the image on every tick made UIKit cross-fade
+// the button image, which is what produced the ghosted / half-rendered icons.
+static UIImage *PlayPauseImage(BOOL playing) {
+    static UIImage *playImage;
+    static UIImage *pauseImage;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        playImage = SymbolImage(@[@"play.fill"], 28.0, UIImageSymbolWeightMedium);
+        pauseImage = SymbolImage(@[@"pause.fill"], 28.0, UIImageSymbolWeightMedium);
+    });
+    return playing ? pauseImage : playImage;
+}
+
+static void HideActivityIndicators(UIView *root) {
+    if (!root) return;
+    for (UIView *view in root.subviews) {
+        if ([view isKindOfClass:[UIActivityIndicatorView class]]) {
+            UIActivityIndicatorView *indicator = (UIActivityIndicatorView *)view;
+            [indicator stopAnimating];
+            indicator.hidden = YES;
+            indicator.alpha = 0.0;
+        }
+        HideActivityIndicators(view);
+    }
+}
+
 static void UpdatePlayIcon(UIView *controls) {
     UIButton *playButton = objc_getAssociatedObject(controls, &kPlayButtonKey);
     if (!playButton) return;
     BOOL playing = CurrentlyPlaying();
     gOptimisticPlaying = playing;
-    UIImage *image = SymbolImage(@[playing ? @"pause.fill" : @"play.fill"], 28.0, UIImageSymbolWeightMedium);
-    [playButton setImage:image forState:UIControlStateNormal];
-    playButton.tintColor = UIColor.whiteColor;
+    UIImage *image = PlayPauseImage(playing);
+    if (!image) return;
+
+    [UIView performWithoutAnimation:^{
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
+        playButton.tintColor = UIColor.whiteColor;
+        if (playButton.currentImage != image) {
+            [playButton setImage:image forState:UIControlStateNormal];
+        }
+        // Stremio swaps its own button for a buffering spinner after a seek; the
+        // tweak owns this button now, so the spinner never belongs there.
+        HideActivityIndicators(playButton);
+        [CATransaction commit];
+    }];
 }
 
 static void UpdatePlayIconSoon(UIView *controls) {
@@ -882,6 +920,24 @@ static void SetupOutplayerUI(UIView *controls) {
     NSLog(@"[OutplayerTweak] Outplayer UI installed on %@", NSStringFromClass([controls class]));
 }
 
+// Stremio's own center transport cluster (skip / play / skip) still exists in
+// 2.1.0 and fades in on top of our pill after a seek, which is what produced the
+// ghosted "10" glyphs and the buffering spinner. Our transport pill replaces it,
+// so the native cluster is hidden instead of being animated behind our back.
+static BOOL IsNativeCenterControl(UIView *view, UIView *controls, NSArray<UIView *> *ours) {
+    if (!view || !controls) return NO;
+    if ([ours containsObject:view]) return NO;
+    if (IsStremioPopupView(view)) return NO;
+    if ([view isKindOfClass:[UIActivityIndicatorView class]]) return YES;
+    if (![view isKindOfClass:[UIButton class]]) return NO;
+    CGSize size = controls.bounds.size;
+    if (size.width < 1.0 || size.height < 1.0) return NO;
+    CGRect frame = [view convertRect:view.bounds toView:controls];
+    CGPoint center = CGPointMake(CGRectGetMidX(frame), CGRectGetMidY(frame));
+    return center.x > size.width * 0.28 && center.x < size.width * 0.72 &&
+           center.y > size.height * 0.18 && center.y < size.height * 0.82;
+}
+
 #pragma mark - Layout
 
 static void LayoutOutplayerUI(UIView *controls) {
@@ -997,6 +1053,11 @@ static void LayoutOutplayerUI(UIView *controls) {
                                 currentLabel, totalLabel, slider];
     for (UIView *view in controls.subviews) {
         if ([ours containsObject:view]) continue;
+        if (IsNativeCenterControl(view, controls, ours)) {
+            view.hidden = YES;
+            view.alpha = 0.0;
+            continue;
+        }
         if ([view isKindOfClass:[UIStackView class]] &&
             view.frame.origin.x > width - 120.0 && view.frame.origin.y < 120.0) {
             view.hidden = YES;
@@ -1528,6 +1589,10 @@ static const CGFloat kPillRow3Y = 64.0;
 static const CGFloat kPillHeight = 92.0;
 static const CGFloat kPillMinContentWidth = 96.0;
 static const CGFloat kPillEdgeMargin = 16.0;
+// Keeps the seek pill clear of the top bar (back button at safeArea.top + 12,
+// 45pt tall). Applied always so the pill can never overlap the back chevron or
+// the title while the controls fade in after a drag.
+static const CGFloat kPillTopRowClearance = 67.0;
 
 - (UIView *)ensurePill {
     UIView *controls = self.controls;
@@ -1653,7 +1718,7 @@ static const CGFloat kPillEdgeMargin = 16.0;
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
     [UIView performWithoutAnimation:^{
-        pill.frame = CGRectMake(safeLeft + kPillEdgeMargin, safeTop + kPillEdgeMargin,
+        pill.frame = CGRectMake(safeLeft + kPillEdgeMargin, safeTop + kPillTopRowClearance,
                                 self.pillWidth, kPillHeight);
         self.targetLabel.frame = CGRectMake(kPillPadding, kPillRow1Y, targetWidth, kPillRow1Height);
         self.arrowLabel.frame = CGRectMake(kPillPadding + content - arrowWidth, kPillRow1Y, arrowWidth,
@@ -2186,6 +2251,118 @@ static void UpdateSubtitlePresentation(UIView *controls) {
     }
 }
 
+#pragma mark - External player links → built-in player
+
+static NSArray<NSString *> *ExternalPlayerSchemes(void) {
+    static NSArray<NSString *> *schemes;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        schemes = @[@"outplayer", @"infuse", @"vlc", @"vlc-x-callback", @"vidhub", @"open-vidhub",
+                    @"cineultra", @"mpv", @"moonplayer", @"justplayer", @"nplayer", @"iina",
+                    @"filebrowser"];
+    });
+    return schemes;
+}
+
+// External player links embed the stream URL as ?url=<encoded>.
+static NSString *StreamURLFromExternalURL(NSURL *url) {
+    if (!url) return nil;
+    NSURLComponents *components = [NSURLComponents componentsWithURL:url resolvingAgainstBaseURL:NO];
+    for (NSURLQueryItem *item in components.queryItems) {
+        NSString *name = item.name.lowercaseString;
+        if ([name isEqualToString:@"url"] || [name isEqualToString:@"stream"] ||
+            [name isEqualToString:@"video"]) {
+            return item.value;
+        }
+    }
+    NSString *raw = url.absoluteString;
+    NSRange range = [raw rangeOfString:@"url="];
+    if (range.location == NSNotFound) return nil;
+    NSString *tail = [raw substringFromIndex:NSMaxRange(range)];
+    NSRange amp = [tail rangeOfString:@"&"];
+    if (amp.location != NSNotFound) tail = [tail substringToIndex:amp.location];
+    return [tail stringByRemovingPercentEncoding] ?: tail;
+}
+
+static UIViewController *OPTopViewController(void) {
+    UIWindow *window = nil;
+    for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+        if (![scene isKindOfClass:[UIWindowScene class]]) continue;
+        for (UIWindow *candidate in ((UIWindowScene *)scene).windows) {
+            if (candidate.isKeyWindow) {
+                window = candidate;
+                break;
+            }
+        }
+        if (window) break;
+    }
+    UIViewController *controller = window.rootViewController;
+    while (controller.presentedViewController) controller = controller.presentedViewController;
+    return controller;
+}
+
+// Looks for an existing "play this stream" entry point on the visible view
+// controller chain and calls it with the URL the external player would receive.
+static BOOL PlayStreamBuiltIn(NSString *streamURL) {
+    if (streamURL.length == 0) return NO;
+    UIViewController *top = OPTopViewController();
+    NSMutableArray *candidates = [NSMutableArray array];
+    for (UIViewController *controller = top; controller; controller = controller.parentViewController) {
+        [candidates addObject:controller];
+        for (UIViewController *child in controller.childViewControllers) [candidates addObject:child];
+    }
+    NSArray<NSString *> *names = @[@"playStream:", @"playOnDevice:", @"playURL:", @"playWithURL:",
+                                   @"openStream:", @"openPlayerWithURL:"];
+    for (id candidate in candidates) {
+        for (NSString *name in names) {
+            SEL selector = NSSelectorFromString(name);
+            if (![candidate respondsToSelector:selector]) continue;
+            CallVoidObj(candidate, selector, streamURL);
+            NSLog(@"[OutplayerTweak] built-in playback via %@ %@", NSStringFromClass([candidate class]), name);
+            return YES;
+        }
+    }
+    return NO;
+}
+
+static IMP gOriginalOpenURL = NULL;
+typedef void (*OpenURLFn)(id, SEL, NSURL *, NSDictionary *, void (^)(BOOL));
+
+static void HookOpenURL(id self, SEL _cmd, NSURL *url, NSDictionary<NSString *, id> *options,
+                        void (^completion)(BOOL)) {
+    NSString *scheme = url.scheme.lowercaseString;
+    if (scheme.length > 0 && [ExternalPlayerSchemes() containsObject:scheme]) {
+        NSString *streamURL = StreamURLFromExternalURL(url);
+        NSLog(@"[OutplayerTweak] intercepted external player link (%@) stream=%@", scheme, streamURL);
+        if (PlayStreamBuiltIn(streamURL)) {
+            if (completion) completion(YES);
+            return;
+        }
+        // No built-in entry point was reachable: keep Stremio on its player
+        // screen instead of handing the stream to another application.
+        NSURL *internal = [NSURL URLWithString:@"stremio:///player?externalPlayerSuccess=1"];
+        if (gOriginalOpenURL && internal) {
+            ((OpenURLFn)gOriginalOpenURL)(self, _cmd, internal, options, completion);
+        } else if (completion) {
+            completion(NO);
+        }
+        return;
+    }
+    if (gOriginalOpenURL) ((OpenURLFn)gOriginalOpenURL)(self, _cmd, url, options, completion);
+}
+
+static IMP gOriginalLocalizedString = NULL;
+static NSString *HookLocalizedString(id self, SEL _cmd, NSString *key, NSString *value, NSString *table) {
+    NSString *result = value;
+    if (gOriginalLocalizedString) {
+        result = ((NSString *(*)(id, SEL, NSString *, NSString *, NSString *))gOriginalLocalizedString)(
+            self, _cmd, key, value, table);
+    }
+    if ([result isEqualToString:@"Harici oynatıcıda oynat"]) return @"Dahili oynatıcıda oynat";
+    if ([result isEqualToString:@"Play in external player"]) return @"Play in built-in player";
+    return result;
+}
+
 #pragma mark - Hooks
 
 static IMP gOriginalViewDidMoveToWindow = NULL;
@@ -2248,5 +2425,8 @@ __attribute__((constructor)) static void TweakInitialize(void) {
     InstallHook(controlsClass, @selector(layoutSubviews), (IMP)HookLayoutSubviews, &gOriginalLayoutSubviews);
     InstallHook(controlsClass, @selector(viewDidMoveToWindow), (IMP)HookViewDidMoveToWindow, &gOriginalViewDidMoveToWindow);
     InstallHook(controlsClass, @selector(gestureRecognizer:shouldReceiveTouch:), (IMP)HookShouldReceiveTouch, &gOriginalShouldReceiveTouch);
+    InstallHook([UIApplication class], @selector(openURL:options:completionHandler:), (IMP)HookOpenURL, &gOriginalOpenURL);
+    InstallHook([NSBundle class], @selector(localizedStringForKey:value:table:), (IMP)HookLocalizedString,
+                &gOriginalLocalizedString);
     NSLog(@"[OutplayerTweak] hooked %@", NSStringFromClass(controlsClass));
 }
