@@ -38,6 +38,8 @@ static NSString *const kSkipIntervalDefaultsKey = @"OPSkipInterval";
 
 static void LayoutOutplayerUI(UIView *controls);
 static void SetupScrub(UIView *controls);
+static void SetupTaps(UIView *controls);
+static UISlider *FindProgressSlider(UIView *root);
 
 static BOOL gOptimisticPlaying = YES;
 
@@ -247,6 +249,7 @@ static void UpdatePlayIconSoon(UIView *controls) {
 
 static void SeekBy(UIView *controls, double seconds) {
     UISlider *slider = objc_getAssociatedObject(controls, &kSliderKey);
+    if (!slider) slider = FindProgressSlider(controls);
     if (!slider) return;
     double duration = CurrentDuration(controls);
     if (duration <= 0) return;
@@ -868,6 +871,7 @@ static void SetupOutplayerUI(UIView *controls) {
     objc_setAssociatedObject(controls, &kTimerKey, timer, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
     SetupScrub(controls);
+    SetupTaps(controls);
 
     NSLog(@"[OutplayerTweak] Outplayer UI installed on %@", NSStringFromClass([controls class]));
 }
@@ -1021,6 +1025,7 @@ static UISlider *FindProgressSlider(UIView *root) {
 #pragma mark - Swipe to scrub (Outplayer style)
 
 static char kScrubberKey;
+static char kTapperKey;
 // Full screen width of dragging == this fraction of the total duration.
 // Smaller = finer control. 0.5 on a 2 hour movie -> ~3 s per point on a 1180 pt iPad.
 static const double kScrubSpanFraction = 0.5;
@@ -1241,6 +1246,128 @@ static void SetupScrub(UIView *controls) {
     NSLog(@"[OutplayerTweak] scrub gesture attached to %@", NSStringFromClass([host class]));
 }
 
+#pragma mark - Tap to play/pause
+
+static BOOL MediaIsReady(UIView *controls) {
+    UISlider *slider = objc_getAssociatedObject(controls, &kSliderKey);
+    if (!slider) slider = FindProgressSlider(controls);
+    return slider != nil && CurrentDuration(controls) > 0;
+}
+
+static void TogglePlayback(UIView *controls) {
+    if (!controls) return;
+
+    UIButton *playButton = objc_getAssociatedObject(controls, &kPlayButtonKey);
+    if ([controls respondsToSelector:@selector(onPlayButtonTap:)]) {
+        CallVoidObj(controls, @selector(onPlayButtonTap:), playButton ? (id)playButton : (id)controls);
+    } else if (playButton) {
+        [playButton sendActionsForControlEvents:UIControlEventTouchUpInside];
+    } else {
+        // Last resort: find a sizeable button in Stremio's own 2.1.0 layout.
+        UIButton *found = nil;
+        for (UIView *view in controls.subviews) {
+            if ([view isKindOfClass:[UIButton class]] && view.bounds.size.width >= 44.0 &&
+                view.bounds.size.height >= 44.0) {
+                found = (UIButton *)view;
+                break;
+            }
+        }
+        if (!found) return;
+        [found sendActionsForControlEvents:UIControlEventTouchUpInside];
+    }
+
+    gOptimisticPlaying = !gOptimisticPlaying;
+    UpdatePlayIcon(controls);
+    UpdatePlayIconSoon(controls);
+}
+
+@interface OPTapper : NSObject <UIGestureRecognizerDelegate>
+@property (nonatomic, weak) UIView *controls;
+@property (nonatomic, weak) UIView *host;
+@end
+
+@implementation OPTapper
+
+- (void)handleTap:(UITapGestureRecognizer *)tap {
+    UIView *controls = self.controls;
+    if (!controls || !MediaIsReady(controls)) return;
+    TogglePlayback(controls);
+}
+
+- (BOOL)isExcluded:(UIView *)view {
+    UIView *controls = self.controls;
+    if (!controls || !view) return NO;
+    if ([view isKindOfClass:[UIControl class]]) return YES;
+
+    UIView *transportPill = objc_getAssociatedObject(controls, &kTransportPillKey);
+    UIView *progressPill = objc_getAssociatedObject(controls, &kProgressPillKey);
+    UIView *rightPill = objc_getAssociatedObject(controls, &kRightPillKey);
+
+    UIView *cursor = view;
+    while (cursor) {
+        if (cursor == transportPill || cursor == progressPill || cursor == rightPill) return YES;
+        cursor = cursor.superview;
+    }
+    return NO;
+}
+
+- (BOOL)isCenterPoint:(CGPoint)point inView:(UIView *)view {
+    if (!view) return NO;
+    CGSize size = view.bounds.size;
+    if (size.width < 1.0 || size.height < 1.0) return NO;
+    CGFloat dx = fabs(point.x - size.width / 2.0) / (size.width / 2.0);
+    CGFloat dy = fabs(point.y - size.height / 2.0) / (size.height / 2.0);
+    return dx <= 0.62 && dy <= 0.72;
+}
+
+- (BOOL)gestureRecognizer:(UIGestureRecognizer *)gestureRecognizer shouldReceiveTouch:(UITouch *)touch {
+    if ([self isExcluded:touch.view]) return NO;
+
+    if ([gestureRecognizer isKindOfClass:[UITapGestureRecognizer class]]) {
+        UITapGestureRecognizer *tap = (UITapGestureRecognizer *)gestureRecognizer;
+        if (tap.numberOfTouchesRequired == 1) {
+            // Centre tap only: edges stay free for Stremio's own hit areas.
+            CGPoint point = [touch locationInView:gestureRecognizer.view];
+            if (![self isCenterPoint:point inView:gestureRecognizer.view]) return NO;
+        }
+    }
+    return YES;
+}
+
+- (BOOL)gestureRecognizerShouldBegin:(UIGestureRecognizer *)gestureRecognizer {
+    UIView *controls = self.controls;
+    if (!controls) return NO;
+    return MediaIsReady(controls);
+}
+
+@end
+
+static void SetupTaps(UIView *controls) {
+    if (objc_getAssociatedObject(controls, &kTapperKey)) return;
+
+    UIView *host = controls.superview ?: controls;
+    OPTapper *tapper = [[OPTapper alloc] init];
+    tapper.controls = controls;
+    tapper.host = host;
+
+    UITapGestureRecognizer *centerTap = [[UITapGestureRecognizer alloc] initWithTarget:tapper action:@selector(handleTap:)];
+    centerTap.numberOfTapsRequired = 1;
+    centerTap.numberOfTouchesRequired = 1;
+    centerTap.delegate = tapper;
+    centerTap.cancelsTouchesInView = NO;
+    [host addGestureRecognizer:centerTap];
+
+    UITapGestureRecognizer *twoFingerTap = [[UITapGestureRecognizer alloc] initWithTarget:tapper action:@selector(handleTap:)];
+    twoFingerTap.numberOfTapsRequired = 1;
+    twoFingerTap.numberOfTouchesRequired = 2;
+    twoFingerTap.delegate = tapper;
+    twoFingerTap.cancelsTouchesInView = NO;
+    [host addGestureRecognizer:twoFingerTap];
+
+    objc_setAssociatedObject(controls, &kTapperKey, tapper, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    NSLog(@"[OutplayerTweak] tap gestures attached to %@", NSStringFromClass([host class]));
+}
+
 #pragma mark - Hooks
 
 static IMP gOriginalViewDidMoveToWindow = NULL;
@@ -1255,6 +1382,7 @@ static void HookViewDidMoveToWindow(id self, SEL _cmd) {
         SetupOutplayerUI(controls);
         LayoutOutplayerUI(controls);
         SetupScrub(controls);
+        SetupTaps(controls);
     });
 }
 
@@ -1266,6 +1394,7 @@ static void HookLayoutSubviews(id self, SEL _cmd) {
     SetupOutplayerUI((UIView *)self);
     LayoutOutplayerUI((UIView *)self);
     SetupScrub((UIView *)self);
+    SetupTaps((UIView *)self);
 }
 
 static IMP gOriginalShouldReceiveTouch = NULL;
