@@ -2412,6 +2412,53 @@ static BOOL ViewTreeContainsContextMenu(UIView *view, NSInteger depth) {
     return NO;
 }
 
+// While a stream context menu is open the external-player preference is
+// temporarily cleared in NSUserDefaults, so the menu's play handler follows the
+// app's own "no external player" branch and starts the built-in KSPlayer. The
+// original values are restored as soon as the menu closes (or after the tap),
+// so normal taps keep opening Outplayer.
+static BOOL gForceBuiltInOnce = NO;
+static NSDictionary *gSavedExternalDefaults = nil;
+
+static BOOL KeyLooksLikeExternalPlayer(NSString *key) {
+    NSString *lower = key.lowercaseString;
+    return [lower containsString:@"external"] || [lower containsString:@"installedplayer"];
+}
+
+static void SuspendExternalPlayerSettings(void) {
+    if (gSavedExternalDefaults) return;
+    NSMutableDictionary *saved = [NSMutableDictionary dictionary];
+    NSDictionary<NSString *, id> *all = [NSUserDefaults.standardUserDefaults dictionaryRepresentation];
+    for (NSString *key in all) {
+        if (!KeyLooksLikeExternalPlayer(key)) continue;
+        id value = all[key];
+        if (!value) continue;
+        saved[key] = value;
+        id replacement = value;
+        if ([value isKindOfClass:[NSString class]]) replacement = @"";
+        else if ([value isKindOfClass:[NSNumber class]]) replacement = @(0);
+        else if ([value isKindOfClass:[NSArray class]]) replacement = @[];
+        else if ([value isKindOfClass:[NSDictionary class]]) replacement = @{};
+        [NSUserDefaults.standardUserDefaults setObject:replacement forKey:key];
+    }
+    if (saved.count == 0) return;
+    [NSUserDefaults.standardUserDefaults synchronize];
+    gSavedExternalDefaults = [saved copy];
+    gForceBuiltInOnce = YES;
+    NSLog(@"[OutplayerTweak] external player suspended for menu play: %@", saved.allKeys);
+}
+
+static void RestoreExternalPlayerSettings(void) {
+    gForceBuiltInOnce = NO;
+    if (!gSavedExternalDefaults) return;
+    for (NSString *key in gSavedExternalDefaults) {
+        [NSUserDefaults.standardUserDefaults setObject:gSavedExternalDefaults[key] forKey:key];
+    }
+    [NSUserDefaults.standardUserDefaults synchronize];
+    gSavedExternalDefaults = nil;
+    NSLog(@"[OutplayerTweak] external player preference restored");
+}
+
 static void UpdateContextMenuWatch(void) {
     BOOL visible = NO;
     for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
@@ -2425,10 +2472,14 @@ static void UpdateContextMenuWatch(void) {
         if (visible) break;
     }
     if (visible) {
-        gContextMenuArmed = YES;
+        if (!gContextMenuArmed) {
+            gContextMenuArmed = YES;
+            SuspendExternalPlayerSettings();
+        }
         gContextMenuSeenAt = CFAbsoluteTimeGetCurrent();
-    } else if (gContextMenuArmed && CFAbsoluteTimeGetCurrent() - gContextMenuSeenAt > 3.0) {
+    } else if (gContextMenuArmed && CFAbsoluteTimeGetCurrent() - gContextMenuSeenAt > 4.0) {
         gContextMenuArmed = NO;
+        RestoreExternalPlayerSettings();
     }
 }
 
@@ -2457,15 +2508,22 @@ static void HookStartAnimating(UIActivityIndicatorView *self, SEL _cmd) {
 static void HookOpenURL(id self, SEL _cmd, NSURL *url, NSDictionary<NSString *, id> *options,
                         void (^completion)(BOOL)) {
     NSString *scheme = url.scheme.lowercaseString;
-    if (scheme.length > 0 && gContextMenuArmed && [ExternalPlayerSchemes() containsObject:scheme]) {
+    BOOL menuPlay = scheme.length > 0 && (gContextMenuArmed || gForceBuiltInOnce) &&
+                    [ExternalPlayerSchemes() containsObject:scheme];
+    if (menuPlay) {
         gContextMenuArmed = NO;
+        gForceBuiltInOnce = NO;
         NSString *streamURL = StreamURLFromExternalURL(url);
         NSLog(@"[OutplayerTweak] context-menu play (%@) stream=%@", scheme, streamURL);
+        RestoreExternalPlayerSettings();
         if (PlayStreamBuiltIn(streamURL)) {
             if (completion) completion(YES);
             return;
         }
-        NSLog(@"[OutplayerTweak] no built-in entry point reachable; using the original external path");
+        // Never hand the menu item to another app; log and stop here.
+        NSLog(@"[OutplayerTweak] no built-in entry point reachable; external launch blocked");
+        if (completion) completion(NO);
+        return;
     }
     // Normal path: byte-for-byte the original behaviour.
     if (gOriginalOpenURL) ((OpenURLFn)gOriginalOpenURL)(self, _cmd, url, options, completion);
@@ -2552,6 +2610,13 @@ __attribute__((constructor)) static void TweakInitialize(void) {
                 &gOriginalStartAnimating);
     [NSTimer scheduledTimerWithTimeInterval:0.4 repeats:YES block:^(NSTimer *timer) {
         UpdateContextMenuWatch();
+    }];
+    [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationDidEnterBackgroundNotification
+                                                    object:nil
+                                                     queue:NSOperationQueue.mainQueue
+                                                usingBlock:^(NSNotification *note) {
+        gContextMenuArmed = NO;
+        RestoreExternalPlayerSettings();
     }];
     NSLog(@"[OutplayerTweak] hooked %@", NSStringFromClass(controlsClass));
 }
