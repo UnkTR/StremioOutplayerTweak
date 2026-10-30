@@ -37,6 +37,7 @@ static char kTimerKey;
 static NSString *const kSkipIntervalDefaultsKey = @"OPSkipInterval";
 
 static void LayoutOutplayerUI(UIView *controls);
+static void SetupScrub(UIView *controls);
 
 static BOOL gOptimisticPlaying = YES;
 
@@ -167,12 +168,58 @@ static double ParseClockTime(NSString *text) {
     return trimmed.doubleValue;
 }
 
+static double MaxClockInView(UIView *root) {
+    if (!root) return 0;
+    double best = 0;
+    for (UIView *view in root.subviews) {
+        if ([view isKindOfClass:[UILabel class]]) {
+            NSString *text = ((UILabel *)view).text;
+            if (text.length > 0 && [text rangeOfString:@":"].location != NSNotFound) {
+                double value = ParseClockTime(text);
+                if (value > best) best = value;
+            }
+        }
+        double nested = MaxClockInView(view);
+        if (nested > best) best = nested;
+    }
+    return best;
+}
+
 static double CurrentDuration(UIView *controls) {
     UILabel *total = objc_getAssociatedObject(controls, &kTotalLabelKey);
     double duration = ParseClockTime(total.text);
     if (duration > 0) return duration;
+
+    // Stremio 2.1.0 reworked the controls; if the restyle bailed out we have no
+    // label reference, so scrape the biggest clock string in the subtree.
+    duration = MaxClockInView(controls);
+    if (duration > 0) return duration;
+
     NSDictionary *info = MPNowPlayingInfoCenter.defaultCenter.nowPlayingInfo;
     return [info[MPMediaItemPropertyPlaybackDuration] doubleValue];
+}
+
+static double SliderProgress(UISlider *slider) {
+    if (!slider) return 0;
+    double min = (double)slider.minimumValue;
+    double max = (double)slider.maximumValue;
+    if (!(max > min)) return (double)slider.value;
+    double progress = ((double)slider.value - min) / (max - min);
+    if (isnan(progress)) return 0;
+    return MAX(0.0, MIN(1.0, progress));
+}
+
+static void SliderSetProgress(UISlider *slider, double progress) {
+    if (!slider) return;
+    if (isnan(progress)) progress = 0;
+    progress = MAX(0.0, MIN(1.0, progress));
+    double min = (double)slider.minimumValue;
+    double max = (double)slider.maximumValue;
+    if (!(max > min)) {
+        slider.value = (float)progress;
+        return;
+    }
+    slider.value = (float)(min + progress * (max - min));
 }
 
 static BOOL CurrentlyPlaying(void) {
@@ -203,16 +250,16 @@ static void SeekBy(UIView *controls, double seconds) {
     if (!slider) return;
     double duration = CurrentDuration(controls);
     if (duration <= 0) return;
-    double target = slider.value + (seconds / duration);
+    double target = SliderProgress(slider) + (seconds / duration);
     target = MAX(0.0, MIN(1.0, target));
     if ([controls respondsToSelector:@selector(onSliderTouchDown:)]) {
         CallVoidObj(controls, @selector(onSliderTouchDown:), slider);
-        slider.value = (float)target;
+        SliderSetProgress(slider, target);
         CallVoidObj(controls, @selector(onSliderValChanged:), slider);
         CallVoidObj(controls, @selector(onSliderTouchUpInside:), slider);
     } else {
         [slider sendActionsForControlEvents:UIControlEventTouchDown];
-        slider.value = (float)target;
+        SliderSetProgress(slider, target);
         [slider sendActionsForControlEvents:UIControlEventValueChanged];
         [slider sendActionsForControlEvents:UIControlEventTouchUpInside];
     }
@@ -958,8 +1005,6 @@ static void LayoutOutplayerUI(UIView *controls) {
     UpdatePlayIcon(controls);
 }
 
-static void SetupScrub(UIView *controls);
-
 static UISlider *FindProgressSlider(UIView *root) {
     if (!root) return nil;
     for (UIView *view in root.subviews) {
@@ -1100,9 +1145,8 @@ static NSString *FormatClock(double seconds) {
     if (target < 0) target = 0;
     if (target > self.duration) target = self.duration;
 
-    slider.value = (float)(target / self.duration);
+    SliderSetProgress(slider, target / self.duration);
     [self call:@selector(onSliderValChanged:) argument:slider];
-
     self.timeLabel.text = [NSString stringWithFormat:@"%@ / %@",
                            FormatClock(target), FormatClock(self.duration)];
     NSString *sign = delta < 0 ? @"-" : @"+";
@@ -1121,7 +1165,7 @@ static NSString *FormatClock(double seconds) {
             double duration = CurrentDuration(controls);
             if (duration <= 0) return;
             self.duration = duration;
-            self.startTime = (double)slider.value * duration;
+            self.startTime = SliderProgress(slider) * duration;
             self.scrubbing = YES;
             [self showPill];
             [self call:@selector(onSliderTouchDown:) argument:slider];
