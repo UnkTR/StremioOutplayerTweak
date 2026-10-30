@@ -1714,15 +1714,15 @@ static void ForceSubtitleTextStyle(void) {
     AddressorFn colorAddressor =
         (AddressorFn)dlsym(RTLD_DEFAULT, "$s8KSPlayer9KSOptionsC9textColorSo7UIColorCvau");
     if (!colorAddressor || !AddressIsExecutable((const void *)colorAddressor)) return;
-    id *colorSlot = (id *)colorAddressor();
+    __strong id *colorSlot = (__strong id *)colorAddressor();
     if (!colorSlot) return;
-    objc_storeStrong(colorSlot, [UIColor colorWithWhite:kSubtitleTextWhite alpha:1.0]);
+    *colorSlot = [UIColor colorWithWhite:kSubtitleTextWhite alpha:1.0];
 
     AddressorFn strokeAddressor =
         (AddressorFn)dlsym(RTLD_DEFAULT, "$s8KSPlayer9KSOptionsC15textStrokeColorSo7UIColorCvau");
     if (strokeAddressor && AddressIsExecutable((const void *)strokeAddressor)) {
-        id *strokeSlot = (id *)strokeAddressor();
-        if (strokeSlot) objc_storeStrong(strokeSlot, UIColor.blackColor);
+        __strong id *strokeSlot = (__strong id *)strokeAddressor();
+        if (strokeSlot) *strokeSlot = UIColor.blackColor;
     }
 
     gSubtitleStyleApplied = YES;
