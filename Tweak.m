@@ -46,6 +46,9 @@ static void SetupTaps(UIView *controls);
 static void UpdateSubtitlePresentation(UIView *controls);
 static void HideControlsScrim(UIView *controls, NSArray<UIView *> *ours);
 static UISlider *FindProgressSlider(UIView *root);
+static NSString *FormatClock(double seconds);
+static BOOL ScrubInfo(UIView *controls, double *outTarget, double *outDuration);
+static char kScrubberKey;
 
 static BOOL gOptimisticPlaying = YES;
 
@@ -343,6 +346,32 @@ static void InvokeStremio(UIView *controls, SEL selector, NSArray<NSString *> *t
 
 #pragma mark - Progress bar (custom thin bar drawn over the original slider)
 
+// Every restyle in this file must be idempotent: re-assigning the same frame /
+// image / alpha on every layout pass is what made UIKit cross-fade buttons while
+// Stremio was fading its controls in (ghosted chevrons and "10" glyphs).
+static void OPSetFrame(UIView *view, CGRect frame) {
+    if (!view) return;
+    if (CGRectEqualToRect(view.frame, frame)) return;
+    view.frame = frame;
+}
+
+static void OPSetCornerRadius(UIView *view, CGFloat radius) {
+    if (!view || view.layer.cornerRadius == radius) return;
+    view.layer.cornerRadius = radius;
+}
+
+static void OPSetHidden(UIView *view, BOOL hidden) {
+    if (!view) return;
+    if (view.hidden == hidden) return;
+    view.hidden = hidden;
+}
+
+static void OPSetAlpha(UIView *view, CGFloat alpha) {
+    if (!view) return;
+    if (fabs(view.alpha - alpha) < 0.001) return;
+    view.alpha = alpha;
+}
+
 static void UpdateProgress(UIView *controls) {
     UISlider *slider = objc_getAssociatedObject(controls, &kSliderKey);
     UIView *track = objc_getAssociatedObject(controls, &kTrackViewKey);
@@ -350,16 +379,33 @@ static void UpdateProgress(UIView *controls) {
     if (!slider || !track || !fill) return;
 
     // The original slider stays interactive but is practically invisible.
-    if (slider.alpha != 0.02f) slider.alpha = 0.02f;
+    OPSetAlpha(slider, 0.02);
 
-    float range = slider.maximumValue - slider.minimumValue;
+    double scrubTarget = 0.0;
+    double scrubDuration = 0.0;
+    BOOL scrubbing = ScrubInfo(controls, &scrubTarget, &scrubDuration);
+
     CGFloat progress = 0.0;
-    if (range > 0.0001f) progress = (slider.value - slider.minimumValue) / range;
+    if (scrubbing && scrubDuration > 0.0) {
+        progress = (CGFloat)(scrubTarget / scrubDuration);
+        UILabel *currentLabel = objc_getAssociatedObject(controls, &kCurrentLabelKey);
+        NSString *text = FormatClock(scrubTarget);
+        if (currentLabel && ![currentLabel.text isEqualToString:text]) currentLabel.text = text;
+    } else {
+        float range = slider.maximumValue - slider.minimumValue;
+        if (range > 0.0001f) progress = (slider.value - slider.minimumValue) / range;
+    }
     if (isnan(progress)) progress = 0.0;
     progress = MAX(0.0, MIN(1.0, progress));
 
     CGRect bounds = track.bounds;
-    fill.frame = CGRectMake(0.0, 0.0, bounds.size.width * progress, bounds.size.height);
+    CGRect fillFrame = CGRectMake(0.0, 0.0, floor(bounds.size.width * progress), bounds.size.height);
+    if (!CGRectEqualToRect(fill.frame, fillFrame)) {
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
+        fill.frame = fillFrame;
+        [CATransaction commit];
+    }
 }
 
 #pragma mark - Popover rows
@@ -905,11 +951,10 @@ static void SetupOutplayerUI(UIView *controls) {
             return;
         }
         tick++;
-        if (tick % 5 == 0) {
+        if (tick % 20 == 0) {
             LayoutOutplayerUI(strongControls);
-        } else {
-            UpdateProgress(strongControls);
         }
+        UpdateProgress(strongControls);
     }];
     [[NSRunLoop mainRunLoop] addTimer:timer forMode:NSRunLoopCommonModes];
     objc_setAssociatedObject(controls, &kTimerKey, timer, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -940,7 +985,7 @@ static BOOL IsNativeCenterControl(UIView *view, UIView *controls, NSArray<UIView
 
 #pragma mark - Layout
 
-static void LayoutOutplayerUI(UIView *controls) {
+static void LayoutOutplayerUIImpl(UIView *controls) {
     if (!objc_getAssociatedObject(controls, &kSetupKey)) return;
 
     UIButton *playButton = objc_getAssociatedObject(controls, &kPlayButtonKey);
@@ -1077,9 +1122,19 @@ static void LayoutOutplayerUI(UIView *controls) {
     UpdatePlayIcon(controls);
 }
 
+// All layout maths runs without implicit animations so UIKit never cross-fades
+// a button that Stremio is also fading in.
+static void LayoutOutplayerUI(UIView *controls) {
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    [UIView performWithoutAnimation:^{
+        LayoutOutplayerUIImpl(controls);
+    }];
+    [CATransaction commit];
+}
+
 static UISlider *FindProgressSlider(UIView *root) {
-    if (!root) return nil;
-    for (UIView *view in root.subviews) {
+    if (!root) return nil;    for (UIView *view in root.subviews) {
         if ([view isKindOfClass:[UISlider class]] &&
             [NSStringFromClass([view class]) containsString:@"ProgressSlider"]) {
             return (UISlider *)view;
@@ -1092,7 +1147,6 @@ static UISlider *FindProgressSlider(UIView *root) {
 
 #pragma mark - Swipe to scrub (Outplayer style)
 
-static char kScrubberKey;
 static char kTapperKey;
 // Full screen width of dragging == this fraction of the total duration.
 // Smaller = finer control. 0.5 on a 2 hour movie -> ~3 s per point on a 1180 pt iPad.
@@ -1376,6 +1430,7 @@ static id OPFindPlayerObject(UIView *view) {
 @property (nonatomic, assign) SEL muteSelector;
 @property (nonatomic, assign) SEL volumeSelector;
 @property (nonatomic, assign) char seekArgType;
+@property (nonatomic, assign) double liveTarget;
 - (void)cancelLiveSession;
 @end
 
@@ -1759,6 +1814,7 @@ static const CGFloat kPillTopRowClearance = 67.0;
     UIView *line = self.line;
     if (!line) return;
 
+    self.liveTarget = target;
     CGFloat progress = self.duration > 0.0 ? (CGFloat)(target / self.duration) : 0.0;
     if (!isfinite(progress)) progress = 0.0;
     progress = MAX(0.0, MIN(1.0, progress));
@@ -1869,6 +1925,15 @@ static const CGFloat kPillTopRowClearance = 67.0;
 }
 
 @end
+
+static BOOL ScrubInfo(UIView *controls, double *outTarget, double *outDuration) {
+    if (!controls) return NO;
+    OPScrubber *scrubber = objc_getAssociatedObject(controls, &kScrubberKey);
+    if (!scrubber || !scrubber.scrubbing) return NO;
+    if (outTarget) *outTarget = scrubber.liveTarget;
+    if (outDuration) *outDuration = scrubber.duration;
+    return YES;
+}
 
 static void AbortLiveScrubbing(UIView *controls) {
     if (!controls) return;
@@ -2328,26 +2393,81 @@ static BOOL PlayStreamBuiltIn(NSString *streamURL) {
 static IMP gOriginalOpenURL = NULL;
 typedef void (*OpenURLFn)(id, SEL, NSURL *, NSDictionary *, void (^)(BOOL));
 
+// --- context menu watch -----------------------------------------------------
+// The stream context menu is SwiftUI; its action calls openURL: with the
+// external player link, exactly like a normal play tap. The only difference we
+// can observe is that the context menu UI is on screen at that moment, so the
+// built-in redirect is armed only while (and shortly after) a context menu is
+// visible. Normal taps are never affected.
+static BOOL gContextMenuArmed = NO;
+static CFAbsoluteTime gContextMenuSeenAt = 0.0;
+
+static BOOL ViewTreeContainsContextMenu(UIView *view, NSInteger depth) {
+    if (!view || depth < 0) return NO;
+    NSString *name = NSStringFromClass([view class]);
+    if ([name rangeOfString:@"ContextMenu" options:NSCaseInsensitiveSearch].location != NSNotFound) return YES;
+    for (UIView *subview in view.subviews) {
+        if (ViewTreeContainsContextMenu(subview, depth - 1)) return YES;
+    }
+    return NO;
+}
+
+static void UpdateContextMenuWatch(void) {
+    BOOL visible = NO;
+    for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+        if (![scene isKindOfClass:[UIWindowScene class]]) continue;
+        for (UIWindow *window in ((UIWindowScene *)scene).windows) {
+            if (ViewTreeContainsContextMenu(window, 12)) {
+                visible = YES;
+                break;
+            }
+        }
+        if (visible) break;
+    }
+    if (visible) {
+        gContextMenuArmed = YES;
+        gContextMenuSeenAt = CFAbsoluteTimeGetCurrent();
+    } else if (gContextMenuArmed && CFAbsoluteTimeGetCurrent() - gContextMenuSeenAt > 3.0) {
+        gContextMenuArmed = NO;
+    }
+}
+
+static BOOL IsInsidePlayer(UIView *view) {
+    for (UIView *cursor = view; cursor; cursor = cursor.superview) {
+        NSString *name = NSStringFromClass([cursor class]);
+        if ([name containsString:@"VideoControlsView"] || [name containsString:@"KSPlayer"] ||
+            [name containsString:@"VideoPlayer"]) {
+            return YES;
+        }
+    }
+    return NO;
+}
+
+static IMP gOriginalStartAnimating = NULL;
+static void HookStartAnimating(UIActivityIndicatorView *self, SEL _cmd) {
+    if (IsInsidePlayer(self)) {
+        // Buffering spinner inside the player: never show it.
+        self.hidden = YES;
+        self.alpha = 0.0;
+        return;
+    }
+    if (gOriginalStartAnimating) ((void (*)(id, SEL))gOriginalStartAnimating)(self, _cmd);
+}
+
 static void HookOpenURL(id self, SEL _cmd, NSURL *url, NSDictionary<NSString *, id> *options,
                         void (^completion)(BOOL)) {
     NSString *scheme = url.scheme.lowercaseString;
-    if (scheme.length > 0 && [ExternalPlayerSchemes() containsObject:scheme]) {
+    if (scheme.length > 0 && gContextMenuArmed && [ExternalPlayerSchemes() containsObject:scheme]) {
+        gContextMenuArmed = NO;
         NSString *streamURL = StreamURLFromExternalURL(url);
-        NSLog(@"[OutplayerTweak] intercepted external player link (%@) stream=%@", scheme, streamURL);
+        NSLog(@"[OutplayerTweak] context-menu play (%@) stream=%@", scheme, streamURL);
         if (PlayStreamBuiltIn(streamURL)) {
             if (completion) completion(YES);
             return;
         }
-        // No built-in entry point was reachable: keep Stremio on its player
-        // screen instead of handing the stream to another application.
-        NSURL *internal = [NSURL URLWithString:@"stremio:///player?externalPlayerSuccess=1"];
-        if (gOriginalOpenURL && internal) {
-            ((OpenURLFn)gOriginalOpenURL)(self, _cmd, internal, options, completion);
-        } else if (completion) {
-            completion(NO);
-        }
-        return;
+        NSLog(@"[OutplayerTweak] no built-in entry point reachable; using the original external path");
     }
+    // Normal path: byte-for-byte the original behaviour.
     if (gOriginalOpenURL) ((OpenURLFn)gOriginalOpenURL)(self, _cmd, url, options, completion);
 }
 
@@ -2428,5 +2548,10 @@ __attribute__((constructor)) static void TweakInitialize(void) {
     InstallHook([UIApplication class], @selector(openURL:options:completionHandler:), (IMP)HookOpenURL, &gOriginalOpenURL);
     InstallHook([NSBundle class], @selector(localizedStringForKey:value:table:), (IMP)HookLocalizedString,
                 &gOriginalLocalizedString);
+    InstallHook([UIActivityIndicatorView class], @selector(startAnimating), (IMP)HookStartAnimating,
+                &gOriginalStartAnimating);
+    [NSTimer scheduledTimerWithTimeInterval:0.4 repeats:YES block:^(NSTimer *timer) {
+        UpdateContextMenuWatch();
+    }];
     NSLog(@"[OutplayerTweak] hooked %@", NSStringFromClass(controlsClass));
 }
