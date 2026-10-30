@@ -12,6 +12,10 @@
 #import <MediaPlayer/MediaPlayer.h>
 #import <CoreText/CoreText.h>
 #import <math.h>
+#import <dlfcn.h>
+#import <mach-o/dyld.h>
+#import <mach-o/loader.h>
+#import <mach/vm_prot.h>
 
 static char kSetupKey;
 static char kTransportPillKey;
@@ -39,6 +43,8 @@ static NSString *const kSkipIntervalDefaultsKey = @"OPSkipInterval";
 static void LayoutOutplayerUI(UIView *controls);
 static void SetupScrub(UIView *controls);
 static void SetupTaps(UIView *controls);
+static void UpdateSubtitlePresentation(UIView *controls);
+static void HideControlsScrim(UIView *controls, NSArray<UIView *> *ours);
 static UISlider *FindProgressSlider(UIView *root);
 
 static BOOL gOptimisticPlaying = YES;
@@ -1005,6 +1011,7 @@ static void LayoutOutplayerUI(UIView *controls) {
     }
 
     EnsureZOrder(controls, ours);
+    HideControlsScrim(controls, ours);
     UpdateProgress(controls);
     UpdatePlayIcon(controls);
 }
@@ -1627,6 +1634,219 @@ static void SetupTaps(UIView *controls) {
     NSLog(@"[OutplayerTweak] tap gestures attached to %@", NSStringFromClass([host class]));
 }
 
+#pragma mark - Subtitles (KSPlayer VideoSubtitleView)
+
+// Stremio renders on-device subtitles with KSPlayer: the text track is decoded by
+// FFmpeg and drawn by KSPlayer's SwiftUI VideoSubtitleView, which lives in a
+// UIHostingController that Stremio stores as `subtitleVC`. The player used here is
+// KSPlayerLayerManager (VLCPlayerManager/MobileVLCKit is only used when the
+// `useVLCKit` setting is on, and libmpv is not linked at all). KSOptions' static
+// text style properties drive that view, so the tweak adjusts both the placement
+// of the hosting view and the static text colour.
+
+// --- Tuning constants -------------------------------------------------------
+// Distance in points between the subtitle block and the top of the bottom
+// control row. Increase to push subtitles further up.
+static const CGFloat kSubtitleGapAboveControls = 26.0;
+// KSPlayer's own bottom padding above the view's bottom edge (used to convert
+// the current position into a lift distance).
+static const CGFloat kSubtitleAssumedBaseInset = 16.0;
+// Clamp for the computed lift, as a fraction of the subtitle view height.
+static const CGFloat kSubtitleMinLiftFraction = 0.04;
+static const CGFloat kSubtitleMaxLiftFraction = 0.22;
+// Fallback target when the bottom control row cannot be measured: share of the
+// screen height kept free below the subtitles.
+static const CGFloat kSubtitleFallbackBottomFraction = 0.15;
+// Subtitle grey level (0-1) forced through KSOptions.textColor.
+static const CGFloat kSubtitleTextWhite = 0.94;
+// Set to NO to leave KSPlayer's own text colour untouched.
+static const BOOL kForceSubtitleTextColor = YES;
+// Set to NO to keep Stremio's bottom dimming gradient above the video.
+static const BOOL kHideControlsScrim = YES;
+// ---------------------------------------------------------------------------
+
+static __weak UIView *gSubtitleHost = nil;
+static BOOL gSubtitleStyleApplied = NO;
+
+static BOOL AddressIsExecutable(const void *address) {
+    if (!address) return NO;
+    uintptr_t target = (uintptr_t)address;
+    uint32_t imageCount = _dyld_image_count();
+    for (uint32_t i = 0; i < imageCount; i++) {
+        const struct mach_header *header = _dyld_get_image_header(i);
+        if (!header) continue;
+        BOOL is64 = (header->magic == MH_MAGIC_64);
+        if (!is64 && header->magic != MH_MAGIC) continue;
+        intptr_t slide = _dyld_get_image_vmaddr_slide(i);
+        uint32_t ncmds = is64 ? ((const struct mach_header_64 *)header)->ncmds : header->ncmds;
+        const uint8_t *cursor = (const uint8_t *)header +
+                                (is64 ? sizeof(struct mach_header_64) : sizeof(struct mach_header));
+        for (uint32_t c = 0; c < ncmds; c++) {
+            const struct load_command *command = (const struct load_command *)cursor;
+            if (command->cmdsize == 0) break;
+            if (command->cmd == LC_SEGMENT_64) {
+                const struct segment_command_64 *segment = (const struct segment_command_64 *)cursor;
+                uintptr_t start = (uintptr_t)(segment->vmaddr + (uint64_t)slide);
+                uintptr_t end = start + (uintptr_t)segment->vmsize;
+                if (target >= start && target < end) {
+                    return (segment->initprot & VM_PROT_EXECUTE) != 0;
+                }
+            } else if (command->cmd == LC_SEGMENT) {
+                const struct segment_command *segment = (const struct segment_command *)cursor;
+                uintptr_t start = (uintptr_t)(segment->vmaddr + (uint32_t)slide);
+                uintptr_t end = start + (uintptr_t)segment->vmsize;
+                if (target >= start && target < end) {
+                    return (segment->initprot & VM_PROT_EXECUTE) != 0;
+                }
+            }
+            cursor += command->cmdsize;
+        }
+    }
+    return NO;
+}
+
+// KSOptions.textColor / textStrokeColor are Swift static properties. The binary
+// exports their unsafe addressors, which return a pointer to the storage slot.
+static void ForceSubtitleTextStyle(void) {
+    if (!kForceSubtitleTextColor || gSubtitleStyleApplied) return;
+
+    typedef void *(*AddressorFn)(void);
+    AddressorFn colorAddressor =
+        (AddressorFn)dlsym(RTLD_DEFAULT, "$s8KSPlayer9KSOptionsC9textColorSo7UIColorCvau");
+    if (!colorAddressor || !AddressIsExecutable((const void *)colorAddressor)) return;
+    id *colorSlot = (id *)colorAddressor();
+    if (!colorSlot) return;
+    objc_storeStrong(colorSlot, [UIColor colorWithWhite:kSubtitleTextWhite alpha:1.0]);
+
+    AddressorFn strokeAddressor =
+        (AddressorFn)dlsym(RTLD_DEFAULT, "$s8KSPlayer9KSOptionsC15textStrokeColorSo7UIColorCvau");
+    if (strokeAddressor && AddressIsExecutable((const void *)strokeAddressor)) {
+        id *strokeSlot = (id *)strokeAddressor();
+        if (strokeSlot) objc_storeStrong(strokeSlot, UIColor.blackColor);
+    }
+
+    gSubtitleStyleApplied = YES;
+    NSLog(@"[OutplayerTweak] forced subtitle text colour");
+}
+
+static UIView *FindSubtitleHostInView(UIView *root, NSInteger depth) {
+    if (!root || depth < 0) return nil;
+    NSString *name = NSStringFromClass([root class]);
+    if ([name containsString:@"VideoSubtitleView"] || [name containsString:@"MetalSubtitleView"] ||
+        [name containsString:@"KSSSubtitleView"]) {
+        return root;
+    }
+    for (UIView *subview in root.subviews) {
+        UIView *found = FindSubtitleHostInView(subview, depth - 1);
+        if (found) return found;
+    }
+    return nil;
+}
+
+static UIViewController *FindSubtitleHostController(UIViewController *controller, NSInteger depth) {
+    if (!controller || depth < 0) return nil;
+    NSString *name = NSStringFromClass([controller class]);
+    if ([name containsString:@"VideoSubtitleView"] || [name containsString:@"MetalSubtitleView"]) {
+        return controller;
+    }
+    for (UIViewController *child in controller.childViewControllers) {
+        UIViewController *found = FindSubtitleHostController(child, depth - 1);
+        if (found) return found;
+    }
+    return nil;
+}
+
+static BOOL LayerTreeHasGradient(CALayer *layer, NSInteger depth) {
+    if (!layer || depth < 0) return NO;
+    if ([layer isKindOfClass:[CAGradientLayer class]]) return YES;
+    for (CALayer *sub in layer.sublayers) {
+        if (LayerTreeHasGradient(sub, depth - 1)) return YES;
+    }
+    return NO;
+}
+
+// Stremio draws a dark scrim inside the controls view; it sits above the video
+// (and therefore above the subtitles). The tweak draws its own pills, so the
+// scrim is only dimming the picture and the subtitles.
+static void HideControlsScrim(UIView *controls, NSArray<UIView *> *ours) {
+    if (!kHideControlsScrim) return;
+    CGFloat width = controls.bounds.size.width;
+    CGFloat height = controls.bounds.size.height;
+    if (width < 1.0 || height < 1.0) return;
+
+    for (UIView *view in controls.subviews) {
+        if ([ours containsObject:view]) continue;
+        if ([view isKindOfClass:[UIControl class]]) continue;
+        if (view.hidden) continue;
+        if (view.bounds.size.width < width * 0.6 || view.bounds.size.height < height * 0.4) continue;
+        if (!LayerTreeHasGradient(view.layer, 4)) continue;
+        view.hidden = YES;
+        view.alpha = 0.0;
+    }
+}
+
+static void UpdateSubtitlePresentation(UIView *controls) {
+    if (!controls) return;
+
+    UIView *host = gSubtitleHost;
+    if (!host || !host.window) {
+        host = FindSubtitleHostInView(controls.window, 40);
+        if (!host) {
+            UIViewController *hostController =
+                FindSubtitleHostController(controls.window.rootViewController, 20);
+            host = hostController.view;
+        }
+        if (host) {
+            gSubtitleHost = host;
+            gSubtitleStyleApplied = NO;
+            NSLog(@"[OutplayerTweak] subtitle host view: %@", NSStringFromClass([host class]));
+        }
+    }
+    if (!host) return;
+
+    ForceSubtitleTextStyle();
+
+    // Keep the subtitle above sibling overlays inside the player view.
+    if (host.superview && host.superview.subviews.lastObject != host) {
+        [host.superview bringSubviewToFront:host];
+    }
+
+    CGFloat height = host.bounds.size.height;
+    if (height < 1.0) height = host.superview.bounds.size.height;
+    if (height < 1.0) return;
+
+    // Bottom edge of the subtitle block, measured from the top of the host view.
+    CGFloat assumedBottom = height - kSubtitleAssumedBaseInset;
+    CGFloat targetBottom = height - height * kSubtitleFallbackBottomFraction;
+
+    UIView *transportPill = objc_getAssociatedObject(controls, &kTransportPillKey);
+    UIView *progressPill = objc_getAssociatedObject(controls, &kProgressPillKey);
+    UIView *rowView = transportPill ?: progressPill;
+    if (rowView && rowView.window && host.window) {
+        CGRect rowInHost = [rowView convertRect:rowView.bounds toView:host];
+        if (CGRectGetWidth(rowInHost) > 1.0 && CGRectGetMinY(rowInHost) > 1.0) {
+            targetBottom = CGRectGetMinY(rowInHost) - kSubtitleGapAboveControls;
+        }
+    } else {
+        CGFloat safeBottom = 0.0;
+        if (@available(iOS 11.0, *)) safeBottom = host.safeAreaInsets.bottom;
+        targetBottom = MIN(targetBottom, height - safeBottom - 43.0 - 13.0 - kSubtitleGapAboveControls);
+    }
+
+    CGFloat lift = assumedBottom - targetBottom;
+    CGFloat minLift = height * kSubtitleMinLiftFraction;
+    CGFloat maxLift = height * kSubtitleMaxLiftFraction;
+    if (lift < minLift) lift = minLift;
+    if (lift > maxLift) lift = maxLift;
+    if (!isfinite(lift) || lift < 0.0) lift = 0.0;
+
+    if (!CGAffineTransformIsIdentity(host.transform)) return;
+    CGAffineTransform desired = CGAffineTransformMakeTranslation(0.0, -lift);
+    if (!CGAffineTransformEqualToTransform(host.transform, desired)) {
+        host.transform = desired;
+    }
+}
+
 #pragma mark - Hooks
 
 static IMP gOriginalViewDidMoveToWindow = NULL;
@@ -1642,6 +1862,7 @@ static void HookViewDidMoveToWindow(id self, SEL _cmd) {
         LayoutOutplayerUI(controls);
         SetupScrub(controls);
         SetupTaps(controls);
+        UpdateSubtitlePresentation(controls);
     });
 }
 
@@ -1654,6 +1875,7 @@ static void HookLayoutSubviews(id self, SEL _cmd) {
     LayoutOutplayerUI((UIView *)self);
     SetupScrub((UIView *)self);
     SetupTaps((UIView *)self);
+    UpdateSubtitlePresentation((UIView *)self);
 }
 
 static IMP gOriginalShouldReceiveTouch = NULL;
