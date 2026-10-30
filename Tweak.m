@@ -1667,6 +1667,7 @@ static const BOOL kHideControlsScrim = YES;
 
 static __weak UIView *gSubtitleHost = nil;
 static BOOL gSubtitleStyleApplied = NO;
+static CFAbsoluteTime gLastSubtitleSearch = 0.0;
 
 static BOOL AddressIsExecutable(const void *address) {
     if (!address) return NO;
@@ -1790,6 +1791,11 @@ static void UpdateSubtitlePresentation(UIView *controls) {
 
     UIView *host = gSubtitleHost;
     if (!host || !host.window) {
+        // Layout fires very often; do not walk the whole window tree every time.
+        CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+        if (now - gLastSubtitleSearch < 0.5) return;
+        gLastSubtitleSearch = now;
+
         host = FindSubtitleHostInView(controls.window, 40);
         if (!host) {
             UIViewController *hostController =
