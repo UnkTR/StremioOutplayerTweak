@@ -8,7 +8,8 @@ on:
 
 jobs:
   build:
-    runs-on: macos-14
+    # macos-14 is being retired (brownouts cancel runs); use the current image.
+    runs-on: macos-15
     steps:
       - name: Checkout
         uses: actions/checkout@v4
