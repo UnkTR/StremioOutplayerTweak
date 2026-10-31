@@ -1,0 +1,54 @@
+name: Inspect Stremio classes
+
+on:
+  workflow_dispatch:
+
+jobs:
+  inspect:
+    runs-on: macos-15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Dump Stremio classes
+        run: |
+          set -uo pipefail
+          rm -rf work out
+          mkdir -p work out
+          unzip -q input/Stremio.ipa -d work
+          APP="work/Payload/Stremio.app"
+          BIN="$APP/Stremio"
+          cp "$APP/menus.json" out/menus.json || true
+
+          # Full ObjC metadata, then keep only the blocks of Stremio's own classes
+          otool -oV "$BIN" > full_objc.txt 2>/dev/null || true
+          wc -l full_objc.txt
+          awk '
+            /^[0-9a-f]{16} 0x[0-9a-f]+ / { if (keep) printf "%s", block; block=""; keep=0 }
+            { block = block $0 "\n" }
+            /_TtC7Stremio|_TtP7Stremio|Stremio\./ { keep=1 }
+            END { if (keep) printf "%s", block }
+          ' full_objc.txt > out/stremio_classes.txt
+          wc -l out/stremio_classes.txt
+
+          # Blocks mentioning the external-player setting
+          awk '
+            /^[0-9a-f]{16} 0x[0-9a-f]+ / { if (keep) printf "%s", block; block=""; keep=0 }
+            { block = block $0 "\n" }
+            /xternalPlayer|installedExternalPlayers|clearExternalPlayer|hasExternalPlayer/ { keep=1 }
+            END { if (keep) printf "%s", block }
+          ' full_objc.txt > out/external_player_classes.txt
+          wc -l out/external_player_classes.txt
+
+          # Swift field names / reflection strings around the setting
+          strings -a "$BIN" | grep -i -E "^(externalPlayer|playInExternalPlayer|hasExternalPlayer|clearExternalPlayer|installedExternalPlayers|playerType|lastUsedStream|streamButton|playStream|openStream|onStream|streamSelected|didSelect)" \
+            | sort -u > out/swift_field_strings.txt || true
+
+          ls -lh out
+
+      - name: Upload report
+        uses: actions/upload-artifact@v4
+        with:
+          name: stremio-classes
+          path: out
+          if-no-files-found: error
