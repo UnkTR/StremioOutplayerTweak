@@ -61,8 +61,6 @@ jobs:
           # iOS 26 Liquid Glass makes buttons ghost/flicker while the controls fade.
           # This key makes iOS render the app with the classic (non-glass) design.
           # Delete these two lines to get Liquid Glass back.
-          /usr/libexec/PlistBuddy -c "Delete :UIDesignRequiresCompatibility" "$APP/Info.plist" 2>/dev/null || true
-          /usr/libexec/PlistBuddy -c "Add :UIDesignRequiresCompatibility bool true" "$APP/Info.plist"
           rm -rf "$APP/_CodeSignature"
 
       - name: Package IPA
